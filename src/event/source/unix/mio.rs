@@ -152,6 +152,15 @@ impl EventSource for UnixInternalEventSource {
         }
     }
 
+    fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>) {
+        self.parser.advance(input, false);
+        events.extend(
+            self.parser
+                .by_ref()
+                .filter(|event| matches!(event, InternalEvent::Event(_))),
+        );
+    }
+
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker {
         self.waker.clone()

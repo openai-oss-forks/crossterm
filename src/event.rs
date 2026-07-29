@@ -254,6 +254,20 @@ pub fn read() -> std::io::Result<Event> {
     }
 }
 
+/// Parse terminal input already read by another terminal consumer and retain its events.
+///
+/// This allows a terminal query to inspect raw responses without discarding interleaved keyboard,
+/// paste, or focus events. Query responses are omitted because the caller already consumed them,
+/// and incomplete sequences remain buffered for the next terminal read.
+#[cfg(unix)]
+pub fn buffer_input(input: &[u8]) -> std::io::Result<()> {
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    lock_internal_event_reader().buffer_input(input)
+}
+
 /// Polls to check if there are any `InternalEvent`s that can be read within the given duration.
 pub(crate) fn poll_internal<F>(timeout: Option<Duration>, filter: &F) -> std::io::Result<bool>
 where

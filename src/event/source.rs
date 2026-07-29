@@ -1,5 +1,8 @@
 use std::{io, time::Duration};
 
+#[cfg(unix)]
+use std::collections::VecDeque;
+
 #[cfg(feature = "event-stream")]
 use super::sys::Waker;
 use super::InternalEvent;
@@ -20,6 +23,10 @@ pub(crate) trait EventSource: Sync + Send {
     ///
     /// Returns `Ok(None)` if there's no event available and timeout expires.
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>>;
+
+    /// Parses bytes consumed outside the source and appends their decoded events in order.
+    #[cfg(unix)]
+    fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>);
 
     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.
     #[cfg(feature = "event-stream")]
