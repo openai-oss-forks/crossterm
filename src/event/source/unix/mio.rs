@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, io, time::Duration};
+use std::{
+    collections::VecDeque,
+    io,
+    time::{Duration, Instant},
+};
 
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use signal_hook_mio::v1_0::Signals;
@@ -20,6 +24,7 @@ const WAKE_TOKEN: Token = Token(2);
 // reading on macOS/Linux -> we don't need bigger buffer and 1k of bytes
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
+const BUFFERED_ESCAPE_TIMEOUT: Duration = Duration::from_millis(20);
 
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
@@ -69,11 +74,15 @@ impl EventSource for UnixInternalEventSource {
         if let Some(event) = self.parser.next() {
             return Ok(Some(event));
         }
+        if let Some(event) = self.parser.finish_pending_escape() {
+            return Ok(Some(event));
+        }
 
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Err(e) = self.poll.poll(&mut self.events, timeout.leftover()) {
+            let poll_timeout = self.parser.poll_timeout(timeout.leftover());
+            if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
                 // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
                 // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
                 // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
@@ -86,7 +95,7 @@ impl EventSource for UnixInternalEventSource {
 
             if self.events.is_empty() {
                 // No readiness events = timeout
-                return Ok(None);
+                return Ok(self.parser.finish_pending_escape());
             }
 
             for token in self.events.iter().map(|x| x.token()) {
@@ -147,18 +156,22 @@ impl EventSource for UnixInternalEventSource {
 
             // Processing above can take some time, check if timeout expired
             if timeout.elapsed() {
-                return Ok(None);
+                return Ok(self.parser.finish_pending_escape());
             }
         }
     }
 
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>) {
-        self.parser.advance(input, false);
+        self.parser.buffer_external_input(input);
         events.extend(
             self.parser
                 .by_ref()
                 .filter(|event| matches!(event, InternalEvent::Event(_))),
         );
+    }
+
+    fn discard_buffered_input(&mut self) {
+        self.parser.clear();
     }
 
     #[cfg(feature = "event-stream")]
@@ -177,6 +190,7 @@ impl EventSource for UnixInternalEventSource {
 struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
+    pending_escape_deadline: Option<Instant>,
 }
 
 impl Default for Parser {
@@ -199,12 +213,46 @@ impl Default for Parser {
             // method implementation, all events are consumed before the next TTY_BUFFER
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
+            pending_escape_deadline: None,
         }
     }
 }
 
 impl Parser {
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.internal_events.clear();
+        self.pending_escape_deadline = None;
+    }
+
+    fn buffer_external_input(&mut self, buffer: &[u8]) {
+        self.advance(buffer, true);
+        if self.buffer.as_slice() == b"\x1b" {
+            self.pending_escape_deadline = Some(Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
+        }
+    }
+
+    fn poll_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
+        let Some(deadline) = self.pending_escape_deadline else {
+            return timeout;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)))
+    }
+
+    fn finish_pending_escape(&mut self) -> Option<InternalEvent> {
+        let deadline = self.pending_escape_deadline?;
+        if Instant::now() < deadline {
+            return None;
+        }
+        self.pending_escape_deadline = None;
+        let event = parse_event(&self.buffer, false).ok().flatten()?;
+        self.buffer.clear();
+        Some(event)
+    }
+
     fn advance(&mut self, buffer: &[u8], more: bool) {
+        self.pending_escape_deadline = None;
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
 
@@ -234,5 +282,51 @@ impl Iterator for Parser {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.internal_events.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Instant, Parser};
+    use crate::event::{Event, InternalEvent, KeyCode};
+
+    #[test]
+    fn externally_buffered_escape_remains_available_for_its_continuation() {
+        let mut parser = Parser::default();
+        parser.buffer_external_input(b"\x1b");
+        assert_eq!(parser.next(), None);
+
+        parser.advance(b"[A", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Up.into())))
+        );
+    }
+
+    #[test]
+    fn standalone_buffered_escape_is_emitted_after_its_ambiguity_window() {
+        let mut parser = Parser::default();
+        parser.buffer_external_input(b"\x1b");
+        assert_eq!(parser.finish_pending_escape(), None);
+
+        parser.pending_escape_deadline = Some(Instant::now());
+        assert_eq!(
+            parser.finish_pending_escape(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+        );
+    }
+
+    #[test]
+    fn clearing_parser_discards_incomplete_bracketed_paste() {
+        let mut parser = Parser::default();
+        parser.advance(b"\x1b[200~unfinished", true);
+        assert_eq!(parser.next(), None);
+
+        parser.clear();
+        parser.advance(b"y", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('y').into())))
+        );
     }
 }

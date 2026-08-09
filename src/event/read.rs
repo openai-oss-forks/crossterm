@@ -42,6 +42,17 @@ impl InternalEventReader {
         Ok(())
     }
 
+    #[cfg(unix)]
+    pub(crate) fn discard_buffered_input(&mut self) -> io::Result<()> {
+        let source = self.source.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "Failed to initialize input reader")
+        })?;
+        source.discard_buffered_input();
+        self.events.clear();
+        self.skipped_events.clear();
+        Ok(())
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
@@ -265,6 +276,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_discard_buffered_input_clears_all_event_queues() {
+        let mut reader = InternalEventReader {
+            events: VecDeque::from([InternalEvent::Event(Event::Resize(10, 10))]),
+            source: Some(Box::new(FakeSource::with_events(&[InternalEvent::Event(
+                Event::Resize(20, 20),
+            )]))),
+            skipped_events: vec![InternalEvent::CursorPosition(4, 8)],
+        };
+
+        reader.discard_buffered_input().unwrap();
+
+        assert!(reader.events.is_empty());
+        assert!(reader.skipped_events.is_empty());
+        assert_eq!(
+            reader
+                .source
+                .as_mut()
+                .unwrap()
+                .try_read(Some(Duration::from_secs(0)))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn test_poll_timeouts_if_source_has_no_events() {
         let source = FakeSource::default();
 
@@ -469,6 +506,11 @@ mod tests {
                     .drain(..)
                     .filter(|event| matches!(event, InternalEvent::Event(_))),
             );
+        }
+
+        #[cfg(unix)]
+        fn discard_buffered_input(&mut self) {
+            self.events.clear();
         }
 
         #[cfg(feature = "event-stream")]

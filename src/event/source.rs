@@ -28,6 +28,10 @@ pub(crate) trait EventSource: Sync + Send {
     #[cfg(unix)]
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>);
 
+    /// Discards decoded events and incomplete input sequences held by this source.
+    #[cfg(unix)]
+    fn discard_buffered_input(&mut self);
+
     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker;

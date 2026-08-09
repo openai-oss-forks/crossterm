@@ -268,6 +268,15 @@ pub fn buffer_input(input: &[u8]) -> std::io::Result<()> {
     lock_internal_event_reader().buffer_input(input)
 }
 
+/// Discard decoded events and incomplete input sequences held by the event reader.
+///
+/// This does not flush the operating system's terminal input queue. Callers that need a clean
+/// input boundary should flush that queue separately before discarding the reader's buffered state.
+#[cfg(unix)]
+pub fn discard_buffered_input() -> std::io::Result<()> {
+    lock_internal_event_reader().discard_buffered_input()
+}
+
 /// Polls to check if there are any `InternalEvent`s that can be read within the given duration.
 pub(crate) fn poll_internal<F>(timeout: Option<Duration>, filter: &F) -> std::io::Result<bool>
 where
