@@ -125,6 +125,13 @@ impl EventSource for UnixInternalEventSource {
                             if let Some(event) = self.parser.next() {
                                 return Ok(Some(event));
                             }
+
+                            // The source owns this descriptor for the lifetime of its borrow.
+                            let fd =
+                                unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
+                            if rustix::io::ioctl_fionread(fd)? == 0 {
+                                break;
+                            }
                         }
                     }
                     SIGNAL_TOKEN => {
@@ -345,6 +352,21 @@ mod tests {
     use crate::terminal::sys::file_descriptor::FileDesc;
     use std::{io::Write, os::unix::net::UnixStream};
 
+    fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        #[cfg(feature = "libc")]
+        let reader = {
+            use std::os::fd::IntoRawFd;
+            FileDesc::new(reader.into_raw_fd(), true)
+        };
+        #[cfg(not(feature = "libc"))]
+        let reader = FileDesc::Owned(reader.into());
+        (
+            UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
+            writer,
+        )
+    }
+
     #[test]
     fn externally_buffered_escape_remains_available_for_its_continuation() {
         let mut parser = Parser::default();
@@ -429,16 +451,7 @@ mod tests {
 
     #[test]
     fn expired_buffered_escape_reads_already_available_continuation_first() {
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        reader.set_nonblocking(true).unwrap();
-        #[cfg(feature = "libc")]
-        let reader = {
-            use std::os::fd::IntoRawFd;
-            FileDesc::new(reader.into_raw_fd(), true)
-        };
-        #[cfg(not(feature = "libc"))]
-        let reader = FileDesc::Owned(reader.into());
-        let mut source = UnixInternalEventSource::from_file_descriptor(reader).unwrap();
+        let (mut source, mut writer) = source_with_input();
         source.parser.buffer_external_input(b"\x1b");
         source.parser.pending_escape_deadline = Some(Instant::now());
         writer.write_all(b"[A").unwrap();
@@ -451,16 +464,7 @@ mod tests {
 
     #[test]
     fn expired_buffered_escape_remains_usable_without_a_continuation() {
-        let (reader, _writer) = UnixStream::pair().unwrap();
-        reader.set_nonblocking(true).unwrap();
-        #[cfg(feature = "libc")]
-        let reader = {
-            use std::os::fd::IntoRawFd;
-            FileDesc::new(reader.into_raw_fd(), true)
-        };
-        #[cfg(not(feature = "libc"))]
-        let reader = FileDesc::Owned(reader.into());
-        let mut source = UnixInternalEventSource::from_file_descriptor(reader).unwrap();
+        let (mut source, _writer) = source_with_input();
         source.parser.buffer_external_input(b"\x1b");
         source.parser.pending_escape_deadline = Some(Instant::now());
         assert_eq!(
@@ -479,6 +483,51 @@ mod tests {
         assert_eq!(
             source.discard_buffered_input(),
             InputDiscardStatus::Complete
+        );
+    }
+
+    #[test]
+    fn discarded_paste_respects_poll_timeout_on_a_blocking_descriptor() {
+        let (mut source, mut writer) = source_with_input();
+        source.parser.advance(b"\x1b[200~", true);
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::BracketedPasteInProgress
+        );
+
+        writer.write_all(b"1y\r").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(25))).unwrap(),
+            None
+        );
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::BracketedPasteInProgress
+        );
+
+        writer.write_all(b"\x1b[201~").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(25))).unwrap(),
+            None
+        );
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::Complete
+        );
+    }
+
+    #[test]
+    fn discarded_paste_drains_input_larger_than_the_read_buffer() {
+        let (mut source, mut writer) = source_with_input();
+        source.parser.advance(b"\x1b[200~", true);
+        source.discard_buffered_input();
+        let mut input = vec![b'y'; super::TTY_BUFFER_SIZE * 2 + 1];
+        input.extend_from_slice(b"\x1b[201~n");
+        writer.write_all(&input).unwrap();
+
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
         );
     }
 }
