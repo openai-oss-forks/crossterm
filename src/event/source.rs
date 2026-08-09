@@ -3,6 +3,9 @@ use std::{io, time::Duration};
 #[cfg(unix)]
 use std::collections::VecDeque;
 
+#[cfg(unix)]
+use super::InputDiscardStatus;
+
 #[cfg(feature = "event-stream")]
 use super::sys::Waker;
 use super::InternalEvent;
@@ -28,9 +31,9 @@ pub(crate) trait EventSource: Sync + Send {
     #[cfg(unix)]
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>);
 
-    /// Discards decoded events and incomplete input sequences held by this source.
+    /// Discards buffered input while preserving incomplete bracketed-paste boundaries.
     #[cfg(unix)]
-    fn discard_buffered_input(&mut self);
+    fn discard_buffered_input(&mut self) -> InputDiscardStatus;
 
     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.
     #[cfg(feature = "event-stream")]

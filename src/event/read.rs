@@ -6,6 +6,8 @@ use crate::event::source::unix::UnixInternalEventSource;
 use crate::event::source::windows::WindowsEventSource;
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
+#[cfg(unix)]
+use crate::event::InputDiscardStatus;
 use crate::event::{filter::Filter, source::EventSource, timeout::PollTimeout, InternalEvent};
 
 /// Can be used to read `InternalEvent`s.
@@ -43,14 +45,14 @@ impl InternalEventReader {
     }
 
     #[cfg(unix)]
-    pub(crate) fn discard_buffered_input(&mut self) -> io::Result<()> {
+    pub(crate) fn discard_buffered_input(&mut self) -> io::Result<InputDiscardStatus> {
         let source = self.source.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "Failed to initialize input reader")
         })?;
-        source.discard_buffered_input();
+        let status = source.discard_buffered_input();
         self.events.clear();
         self.skipped_events.clear();
-        Ok(())
+        Ok(status)
     }
 
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
@@ -286,7 +288,10 @@ mod tests {
             skipped_events: vec![InternalEvent::CursorPosition(4, 8)],
         };
 
-        reader.discard_buffered_input().unwrap();
+        assert_eq!(
+            reader.discard_buffered_input().unwrap(),
+            super::InputDiscardStatus::Complete
+        );
 
         assert!(reader.events.is_empty());
         assert!(reader.skipped_events.is_empty());
@@ -509,8 +514,9 @@ mod tests {
         }
 
         #[cfg(unix)]
-        fn discard_buffered_input(&mut self) {
+        fn discard_buffered_input(&mut self) -> super::InputDiscardStatus {
             self.events.clear();
+            super::InputDiscardStatus::Complete
         }
 
         #[cfg(feature = "event-stream")]

@@ -268,12 +268,24 @@ pub fn buffer_input(input: &[u8]) -> std::io::Result<()> {
     lock_internal_event_reader().buffer_input(input)
 }
 
-/// Discard decoded events and incomplete input sequences held by the event reader.
+/// Whether discarding buffered input encountered an incomplete bracketed paste.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputDiscardStatus {
+    /// Buffered events and incomplete input sequences were fully discarded.
+    Complete,
+    /// A bracketed paste started before the discard and has not finished yet.
+    BracketedPasteInProgress,
+}
+
+/// Discard decoded events while preserving incomplete bracketed-paste boundaries.
 ///
 /// This does not flush the operating system's terminal input queue. Callers that need a clean
-/// input boundary should flush that queue separately before discarding the reader's buffered state.
+/// input boundary should drain it through the event reader. If an incomplete bracketed paste is
+/// reported, its remaining bytes are discarded without producing events until its closing marker
+/// arrives. Call this function again to determine whether the paste has finished.
 #[cfg(unix)]
-pub fn discard_buffered_input() -> std::io::Result<()> {
+pub fn discard_buffered_input() -> std::io::Result<InputDiscardStatus> {
     lock_internal_event_reader().discard_buffered_input()
 }
 
