@@ -35,6 +35,7 @@ pub(crate) struct UnixInternalEventSource {
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
+    pending_tty_readable: bool,
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
@@ -65,6 +66,7 @@ impl UnixInternalEventSource {
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
+            pending_tty_readable: false,
             signals,
             #[cfg(feature = "event-stream")]
             waker,
@@ -80,21 +82,25 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            let poll_timeout = self.parser.poll_timeout(timeout.leftover());
-            if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
-                // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
-                // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
-                // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                } else {
-                    return Err(e);
+            if self.pending_tty_readable {
+                self.pending_tty_readable = false;
+            } else {
+                let poll_timeout = self.parser.poll_timeout(timeout.leftover());
+                if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
+                    // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
+                    // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
+                    // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
                 }
-            };
 
-            if self.events.is_empty() {
-                // No readiness events = timeout
-                return Ok(self.parser.finish_pending_escape());
+                if self.events.is_empty() {
+                    // No readiness events = timeout
+                    return Ok(self.parser.finish_pending_escape());
+                }
             }
 
             for token in self.events.iter().map(|x| x.token()) {
@@ -131,6 +137,10 @@ impl EventSource for UnixInternalEventSource {
                                 unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
                             if rustix::io::ioctl_fionread(fd)? == 0 {
                                 break;
+                            }
+                            if timeout.elapsed() {
+                                self.pending_tty_readable = true;
+                                return Ok(self.parser.finish_pending_escape());
                             }
                         }
                     }
@@ -529,5 +539,46 @@ mod tests {
             source.try_read(Some(Duration::from_millis(100))).unwrap(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
         );
+    }
+
+    #[test]
+    fn continuously_readable_discarded_paste_respects_poll_deadline() {
+        let (mut source, mut writer) = source_with_input();
+        source.parser.advance(b"\x1b[200~", true);
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::BracketedPasteInProgress
+        );
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let producer = std::thread::spawn(move || {
+            let chunk = [b'y'; super::TTY_BUFFER_SIZE];
+            for index in 0..65_536 {
+                if writer.write_all(&chunk).is_err() {
+                    break;
+                }
+                if index == 0 {
+                    ready_tx.send(()).unwrap();
+                }
+            }
+        });
+        ready_rx.recv().unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                source.try_read(Some(Duration::from_millis(10))).unwrap(),
+                None
+            );
+            assert!(source.pending_tty_readable);
+            assert_eq!(
+                source.discard_buffered_input(),
+                InputDiscardStatus::BracketedPasteInProgress
+            );
+            let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(source.tty_fd.raw_fd()) };
+            assert!(rustix::io::ioctl_fionread(fd).unwrap() > 0);
+        }
+
+        drop(source);
+        producer.join().unwrap();
     }
 }

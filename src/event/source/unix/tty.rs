@@ -175,6 +175,9 @@ impl EventSource for UnixInternalEventSource {
                     if read_count == 0 || rustix::io::ioctl_fionread(fd)? == 0 {
                         break;
                     }
+                    if timeout.elapsed() {
+                        return Ok(self.parser.finish_pending_escape());
+                    }
                 }
             }
             if let Some(event) = self.parser.finish_pending_escape() {
@@ -585,5 +588,45 @@ mod tests {
             source.try_read(Some(Duration::from_millis(100))).unwrap(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
         );
+    }
+
+    #[test]
+    fn continuously_readable_discarded_paste_respects_poll_deadline() {
+        let (mut source, mut writer) = source_with_input();
+        source.parser.advance(b"\x1b[200~", true);
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::BracketedPasteInProgress
+        );
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let producer = std::thread::spawn(move || {
+            let chunk = [b'y'; super::TTY_BUFFER_SIZE];
+            for index in 0..65_536 {
+                if writer.write_all(&chunk).is_err() {
+                    break;
+                }
+                if index == 0 {
+                    ready_tx.send(()).unwrap();
+                }
+            }
+        });
+        ready_rx.recv().unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                source.try_read(Some(Duration::from_millis(10))).unwrap(),
+                None
+            );
+            assert_eq!(
+                source.discard_buffered_input(),
+                InputDiscardStatus::BracketedPasteInProgress
+            );
+            let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(source.tty.raw_fd()) };
+            assert!(rustix::io::ioctl_fionread(fd).unwrap() > 0);
+        }
+
+        drop(source);
+        producer.join().unwrap();
     }
 }
