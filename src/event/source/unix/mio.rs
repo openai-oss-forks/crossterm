@@ -249,13 +249,6 @@ impl Default for Parser {
 
 impl Parser {
     fn discard_buffered_input(&mut self) -> InputDiscardStatus {
-        if self.discarded_sequence.is_none() && self.buffer.as_slice() == b"\x1b" {
-            self.internal_events.clear();
-            self.pending_escape_deadline
-                .get_or_insert_with(|| Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
-            return InputDiscardStatus::BracketedPasteInProgress;
-        }
-
         if self.discarded_sequence.is_none() {
             if self.buffer.starts_with(BRACKETED_PASTE_START) {
                 let matched = (1..BRACKETED_PASTE_END.len())
@@ -482,6 +475,25 @@ mod tests {
             parser.finish_pending_escape(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
         );
+    }
+
+    #[test]
+    fn discarded_escape_suppresses_a_delayed_modifier_suffix() {
+        for suffix in [b'y', b'1'] {
+            let mut parser = Parser::default();
+            parser.buffer_external_input(b"\x1b");
+            parser.pending_escape_deadline = Some(Instant::now());
+
+            assert_eq!(
+                parser.discard_buffered_input(),
+                InputDiscardStatus::BracketedPasteInProgress
+            );
+            assert_eq!(parser.finish_pending_escape(), None);
+            parser.advance(std::slice::from_ref(&suffix), false);
+
+            assert_eq!(parser.next(), None);
+            assert_eq!(parser.discard_buffered_input(), InputDiscardStatus::Complete);
+        }
     }
 
     #[test]
@@ -755,14 +767,6 @@ mod tests {
         let (mut source, _writer) = source_with_input();
         source.parser.buffer_external_input(b"\x1b");
         source.parser.pending_escape_deadline = Some(Instant::now());
-        assert_eq!(
-            source.discard_buffered_input(),
-            InputDiscardStatus::BracketedPasteInProgress
-        );
-        assert_eq!(
-            source.discard_buffered_input(),
-            InputDiscardStatus::BracketedPasteInProgress
-        );
 
         assert_eq!(
             source.try_read(Some(Duration::ZERO)).unwrap(),
