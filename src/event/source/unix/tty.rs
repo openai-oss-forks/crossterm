@@ -442,8 +442,20 @@ impl Parser {
                     self.buffer.clear();
                 }
                 Ok(None) => {
-                    // Event can't be parsed, because we don't have enough bytes for
-                    // the current sequence. Keep the buffer and process next bytes.
+                    let completed_osc = self.buffer.starts_with(b"\x1b]")
+                        && (*byte == b'\x07'
+                            || (*byte == b'\\'
+                                && self.buffer.get(self.buffer.len().saturating_sub(2))
+                                    == Some(&b'\x1b')));
+                    let completed_csi = self.buffer.len() > 2
+                        && self.buffer.starts_with(b"\x1b[")
+                        && (0x40..=0x7e).contains(byte)
+                        && !self.buffer.starts_with(BRACKETED_PASTE_START)
+                        && !self.buffer.starts_with(b"\x1b[[")
+                        && !self.buffer.starts_with(b"\x1b[M");
+                    if completed_osc || completed_csi {
+                        self.buffer.clear();
+                    }
                 }
                 Err(_) => {
                     // Event can't be parsed (not enough parameters, parameter is not a number, ...).
@@ -553,6 +565,76 @@ mod tests {
             parser.next(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
         );
+    }
+
+    #[test]
+    fn completed_unsupported_control_sequences_do_not_remain_buffered() {
+        for sequence in [
+            b"\x1b]52;c;ignored\x07".as_slice(),
+            b"\x1b]52;c;ignored\x1b\\".as_slice(),
+            b"\x1b[?1h".as_slice(),
+            b"\x1b[?1;2$y".as_slice(),
+        ] {
+            let mut parser = Parser::default();
+            for byte in sequence {
+                parser.advance(std::slice::from_ref(byte), true);
+            }
+            assert!(parser.buffer.is_empty());
+            assert_eq!(
+                parser.discard_buffered_input(),
+                InputDiscardStatus::Complete
+            );
+            parser.advance(b"n", false);
+
+            assert_eq!(
+                parser.next(),
+                Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
+            );
+        }
+    }
+
+    #[test]
+    fn completed_control_sequence_preserves_a_following_incomplete_boundary() {
+        for (incomplete, continuation, status) in [
+            (
+                b"\x1b[2".as_slice(),
+                b"00~1y\r\x1b[201~n".as_slice(),
+                InputDiscardStatus::BracketedPasteInProgress,
+            ),
+            (
+                b"\x1b]10;unfinished".as_slice(),
+                b"1y\r\x07n".as_slice(),
+                InputDiscardStatus::ControlSequenceInProgress,
+            ),
+        ] {
+            let mut parser = Parser::default();
+            let mut input = b"\x1b]52;c;ignored\x07".to_vec();
+            input.extend_from_slice(incomplete);
+            parser.advance(&input, true);
+            assert_eq!(parser.discard_buffered_input(), status);
+            parser.advance(continuation, false);
+
+            assert_eq!(
+                parser.next(),
+                Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_mouse_and_function_key_sequences_remain_recognized() {
+        let mut parser = Parser::default();
+        parser.advance(b"\x1b[[A", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::F(1).into())))
+        );
+
+        parser.advance(b"\x1b[M !!", false);
+        assert!(matches!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Mouse(_)))
+        ));
     }
 
     #[test]
