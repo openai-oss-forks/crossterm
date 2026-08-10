@@ -217,6 +217,7 @@ enum DiscardedSequence {
     OscBody,
     OscEscape,
     Csi,
+    X10Mouse(usize),
     Ss3,
 }
 
@@ -270,6 +271,8 @@ impl Parser {
                 } else {
                     DiscardedSequence::OscBody
                 });
+            } else if self.buffer.starts_with(b"\x1b[M") {
+                self.discarded_sequence = Some(DiscardedSequence::X10Mouse(6 - self.buffer.len()));
             } else if self.buffer.starts_with(b"\x1b[") {
                 self.discarded_sequence = Some(DiscardedSequence::Csi);
             } else if self.buffer.starts_with(b"\x1bO") {
@@ -337,6 +340,9 @@ impl Parser {
                     DiscardedSequence::PasteStart(1) if *byte == b'O' => {
                         Some(DiscardedSequence::Ss3)
                     }
+                    DiscardedSequence::PasteStart(2) if *byte == b'M' => {
+                        Some(DiscardedSequence::X10Mouse(3))
+                    }
                     DiscardedSequence::PasteStart(matched)
                         if matched >= 2 && !(0x40..=0x7e).contains(byte) =>
                     {
@@ -379,6 +385,10 @@ impl Parser {
                         None
                     }
                     DiscardedSequence::Csi => Some(DiscardedSequence::Csi),
+                    DiscardedSequence::X10Mouse(remaining) if remaining > 1 => {
+                        Some(DiscardedSequence::X10Mouse(remaining - 1))
+                    }
+                    DiscardedSequence::X10Mouse(_) => None,
                     DiscardedSequence::Ss3 => Some(DiscardedSequence::Ss3),
                 };
                 continue;
@@ -516,6 +526,33 @@ mod tests {
             parser.next(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
         );
+    }
+
+    #[test]
+    fn discarded_partial_mouse_sequence_preserves_all_remaining_payload_bytes() {
+        for sequence in [b"\x1b[M @y".as_slice(), b"\x1b[M\x1b@y".as_slice()] {
+            for boundary in 1..sequence.len() {
+                let mut parser = Parser::default();
+                parser.advance(&sequence[..boundary], true);
+                assert_ne!(parser.discard_buffered_input(), InputDiscardStatus::Complete);
+
+                let remainder = &sequence[boundary..];
+                for (index, byte) in remainder.iter().enumerate() {
+                    parser.advance(std::slice::from_ref(byte), false);
+                    assert_eq!(parser.next(), None);
+                    assert_eq!(
+                        parser.discard_buffered_input() == InputDiscardStatus::Complete,
+                        index + 1 == remainder.len(),
+                    );
+                }
+
+                parser.advance(b"n", false);
+                assert_eq!(
+                    parser.next(),
+                    Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
+                );
+            }
+        }
     }
 
     #[test]
