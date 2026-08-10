@@ -251,13 +251,17 @@ struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
     pending_escape_deadline: Option<Instant>,
-    discarded_paste: Option<DiscardedPaste>,
+    discarded_sequence: Option<DiscardedSequence>,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum DiscardedPaste {
-    Start(usize),
-    End(usize),
+enum DiscardedSequence {
+    PasteStart(usize),
+    PasteBody(usize),
+    OscBody,
+    OscEscape,
+    Csi,
+    Ss3,
 }
 
 impl Default for Parser {
@@ -281,34 +285,50 @@ impl Default for Parser {
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
             pending_escape_deadline: None,
-            discarded_paste: None,
+            discarded_sequence: None,
         }
     }
 }
 
 impl Parser {
     fn discard_buffered_input(&mut self) -> InputDiscardStatus {
-        if self.discarded_paste.is_none() && self.buffer.as_slice() == b"\x1b" {
+        if self.discarded_sequence.is_none() && self.buffer.as_slice() == b"\x1b" {
             self.internal_events.clear();
             self.pending_escape_deadline
                 .get_or_insert_with(|| Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
             return InputDiscardStatus::BracketedPasteInProgress;
         }
 
-        if self.discarded_paste.is_none() {
+        if self.discarded_sequence.is_none() {
             if self.buffer.starts_with(BRACKETED_PASTE_START) {
-                self.discarded_paste = Some(DiscardedPaste::End(0));
+                let matched = (1..BRACKETED_PASTE_END.len())
+                    .rev()
+                    .find(|&matched| self.buffer.ends_with(&BRACKETED_PASTE_END[..matched]))
+                    .unwrap_or(0);
+                self.discarded_sequence = Some(DiscardedSequence::PasteBody(matched));
             } else if !self.buffer.is_empty() && BRACKETED_PASTE_START.starts_with(&self.buffer) {
-                self.discarded_paste = Some(DiscardedPaste::Start(self.buffer.len()));
+                self.discarded_sequence = Some(DiscardedSequence::PasteStart(self.buffer.len()));
+            } else if self.buffer.starts_with(b"\x1b]") {
+                self.discarded_sequence = Some(if self.buffer.ends_with(b"\x1b") {
+                    DiscardedSequence::OscEscape
+                } else {
+                    DiscardedSequence::OscBody
+                });
+            } else if self.buffer.starts_with(b"\x1b[") {
+                self.discarded_sequence = Some(DiscardedSequence::Csi);
+            } else if self.buffer.starts_with(b"\x1bO") {
+                self.discarded_sequence = Some(DiscardedSequence::Ss3);
             }
         }
         self.buffer.clear();
         self.internal_events.clear();
         self.pending_escape_deadline = None;
-        if self.discarded_paste.is_some() {
-            InputDiscardStatus::BracketedPasteInProgress
-        } else {
-            InputDiscardStatus::Complete
+        match self.discarded_sequence {
+            Some(DiscardedSequence::PasteStart(_) | DiscardedSequence::PasteBody(_)) => {
+                InputDiscardStatus::BracketedPasteInProgress
+            }
+            Some(_) => InputDiscardStatus::ControlSequenceInProgress,
+            None => InputDiscardStatus::Complete,
         }
     }
 
@@ -346,30 +366,69 @@ impl Parser {
     fn advance(&mut self, buffer: &[u8], more: bool) {
         self.pending_escape_deadline = None;
         for (idx, byte) in buffer.iter().enumerate() {
-            if let Some(discarded_paste) = self.discarded_paste {
-                self.discarded_paste = match discarded_paste {
-                    DiscardedPaste::Start(matched) if *byte == BRACKETED_PASTE_START[matched] => {
+            if let Some(discarded_sequence) = self.discarded_sequence {
+                self.discarded_sequence = match discarded_sequence {
+                    DiscardedSequence::PasteStart(matched)
+                        if *byte == BRACKETED_PASTE_START[matched] =>
+                    {
                         if matched + 1 == BRACKETED_PASTE_START.len() {
-                            Some(DiscardedPaste::End(0))
+                            Some(DiscardedSequence::PasteBody(0))
                         } else {
-                            Some(DiscardedPaste::Start(matched + 1))
+                            Some(DiscardedSequence::PasteStart(matched + 1))
                         }
                     }
-                    DiscardedPaste::Start(_) if *byte == BRACKETED_PASTE_START[0] => {
-                        Some(DiscardedPaste::Start(1))
+                    DiscardedSequence::PasteStart(_) if *byte == BRACKETED_PASTE_START[0] => {
+                        Some(DiscardedSequence::PasteStart(1))
                     }
-                    DiscardedPaste::Start(_) => None,
-                    DiscardedPaste::End(matched) if *byte == BRACKETED_PASTE_END[matched] => {
+                    DiscardedSequence::PasteStart(1) if *byte == b']' => {
+                        Some(DiscardedSequence::OscBody)
+                    }
+                    DiscardedSequence::PasteStart(1) if *byte == b'O' => {
+                        Some(DiscardedSequence::Ss3)
+                    }
+                    DiscardedSequence::PasteStart(matched)
+                        if matched >= 2 && !(0x40..=0x7e).contains(byte) =>
+                    {
+                        Some(DiscardedSequence::Csi)
+                    }
+                    DiscardedSequence::PasteStart(_) => None,
+                    DiscardedSequence::PasteBody(matched)
+                        if *byte == BRACKETED_PASTE_END[matched] =>
+                    {
                         if matched + 1 == BRACKETED_PASTE_END.len() {
                             None
                         } else {
-                            Some(DiscardedPaste::End(matched + 1))
+                            Some(DiscardedSequence::PasteBody(matched + 1))
                         }
                     }
-                    DiscardedPaste::End(_) if *byte == BRACKETED_PASTE_END[0] => {
-                        Some(DiscardedPaste::End(1))
+                    DiscardedSequence::PasteBody(_) if *byte == BRACKETED_PASTE_END[0] => {
+                        Some(DiscardedSequence::PasteBody(1))
                     }
-                    DiscardedPaste::End(_) => Some(DiscardedPaste::End(0)),
+                    DiscardedSequence::PasteBody(_) => Some(DiscardedSequence::PasteBody(0)),
+                    DiscardedSequence::OscBody | DiscardedSequence::OscEscape
+                        if *byte == b'\x07' =>
+                    {
+                        None
+                    }
+                    DiscardedSequence::OscEscape if *byte == b'\\' => None,
+                    DiscardedSequence::OscBody | DiscardedSequence::OscEscape
+                        if *byte == b'\x1b' =>
+                    {
+                        Some(DiscardedSequence::OscEscape)
+                    }
+                    DiscardedSequence::OscBody | DiscardedSequence::OscEscape => {
+                        Some(DiscardedSequence::OscBody)
+                    }
+                    DiscardedSequence::Csi | DiscardedSequence::Ss3 if *byte == b'\x1b' => {
+                        Some(DiscardedSequence::PasteStart(1))
+                    }
+                    DiscardedSequence::Csi | DiscardedSequence::Ss3
+                        if (0x40..=0x7e).contains(byte) =>
+                    {
+                        None
+                    }
+                    DiscardedSequence::Csi => Some(DiscardedSequence::Csi),
+                    DiscardedSequence::Ss3 => Some(DiscardedSequence::Ss3),
                 };
                 continue;
             }
@@ -494,6 +553,106 @@ mod tests {
             parser.next(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
         );
+    }
+
+    #[test]
+    fn discarded_osc_suppresses_delayed_input_until_its_terminator() {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let mut parser = Parser::default();
+            parser.advance(b"\x1b]10;unfinished", true);
+            assert_eq!(
+                parser.discard_buffered_input(),
+                InputDiscardStatus::ControlSequenceInProgress
+            );
+
+            parser.advance(b"1y\r", true);
+            assert!(parser.buffer.is_empty());
+            assert_eq!(parser.next(), None);
+            for byte in terminator {
+                parser.advance(std::slice::from_ref(byte), true);
+            }
+            parser.advance(b"n", false);
+
+            assert_eq!(
+                parser.next(),
+                Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
+            );
+            assert_eq!(
+                parser.discard_buffered_input(),
+                InputDiscardStatus::Complete
+            );
+        }
+    }
+
+    #[test]
+    fn discarded_control_sequences_suppress_delayed_input_until_the_final_byte() {
+        for prefix in [b"\x1b[?".as_slice(), b"\x1bO".as_slice()] {
+            let mut parser = Parser::default();
+            parser.advance(prefix, true);
+            assert_eq!(
+                parser.discard_buffered_input(),
+                InputDiscardStatus::ControlSequenceInProgress
+            );
+
+            parser.advance(b"1\r", true);
+            assert!(parser.buffer.is_empty());
+            assert_eq!(parser.next(), None);
+            parser.advance(b"An", false);
+
+            assert_eq!(
+                parser.next(),
+                Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_paste_prefix_remains_quarantined_as_a_control_sequence() {
+        let mut parser = Parser::default();
+        parser.advance(b"\x1b[2", true);
+        assert_eq!(
+            parser.discard_buffered_input(),
+            InputDiscardStatus::BracketedPasteInProgress
+        );
+
+        parser.advance(b"1\r", true);
+        assert_eq!(parser.next(), None);
+        assert_eq!(
+            parser.discard_buffered_input(),
+            InputDiscardStatus::ControlSequenceInProgress
+        );
+        parser.advance(b"~n", false);
+
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
+        );
+    }
+
+    #[test]
+    fn discarded_sequences_preserve_a_buffered_terminator_prefix() {
+        for (prefix, suffix, status) in [
+            (
+                b"\x1b]10;unfinished\x1b".as_slice(),
+                b"\\n".as_slice(),
+                InputDiscardStatus::ControlSequenceInProgress,
+            ),
+            (
+                b"\x1b[200~unfinished\x1b[20".as_slice(),
+                b"1~n".as_slice(),
+                InputDiscardStatus::BracketedPasteInProgress,
+            ),
+        ] {
+            let mut parser = Parser::default();
+            parser.advance(prefix, true);
+            assert_eq!(parser.discard_buffered_input(), status);
+            parser.advance(suffix, false);
+
+            assert_eq!(
+                parser.next(),
+                Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
+            );
+        }
     }
 
     #[test]

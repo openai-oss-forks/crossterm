@@ -31,7 +31,7 @@ pub(crate) trait EventSource: Sync + Send {
     #[cfg(unix)]
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>);
 
-    /// Discards buffered input while preserving incomplete bracketed-paste boundaries.
+    /// Discards buffered input while preserving incomplete control-sequence boundaries.
     #[cfg(unix)]
     fn discard_buffered_input(&mut self) -> InputDiscardStatus;
 

@@ -268,7 +268,7 @@ pub fn buffer_input(input: &[u8]) -> std::io::Result<()> {
     lock_internal_event_reader().buffer_input(input)
 }
 
-/// Whether discarding buffered input encountered an incomplete bracketed paste.
+/// Whether discarding buffered input encountered an incomplete control sequence.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputDiscardStatus {
@@ -276,14 +276,16 @@ pub enum InputDiscardStatus {
     Complete,
     /// A bracketed paste started before the discard and has not finished yet.
     BracketedPasteInProgress,
+    /// An escape control sequence started before the discard and has not finished yet.
+    ControlSequenceInProgress,
 }
 
-/// Discard decoded events while preserving incomplete bracketed-paste boundaries.
+/// Discard decoded events while preserving incomplete escape-sequence boundaries.
 ///
 /// This does not flush the operating system's terminal input queue. Callers that need a clean
-/// input boundary should drain it through the event reader. If an incomplete bracketed paste is
-/// reported, its remaining bytes are discarded without producing events until its closing marker
-/// arrives. Call this function again to determine whether the paste has finished.
+/// input boundary should drain it through the event reader. If an incomplete bracketed paste or
+/// other control sequence is reported, its remaining bytes are discarded without producing events
+/// until its closing marker arrives. Call this function again to determine whether it has finished.
 #[cfg(unix)]
 pub fn discard_buffered_input() -> std::io::Result<InputDiscardStatus> {
     lock_internal_event_reader().discard_buffered_input()
