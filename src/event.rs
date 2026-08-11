@@ -259,6 +259,10 @@ pub fn read() -> std::io::Result<Event> {
 /// This allows a terminal query to inspect raw responses without discarding interleaved keyboard,
 /// paste, or focus events. Query responses are omitted because the caller already consumed them,
 /// and incomplete sequences remain buffered for the next terminal read.
+///
+/// Drop or pause all active `EventStream`s and other blocking event-reader users before calling this
+/// function. Event readers share a global lock, so a concurrently blocked reader can prevent it from
+/// returning.
 #[cfg(unix)]
 pub fn buffer_input(input: &[u8]) -> std::io::Result<()> {
     if input.is_empty() {
@@ -286,6 +290,10 @@ pub enum InputDiscardStatus {
 /// input boundary should drain it through the event reader. If an incomplete bracketed paste or
 /// other control sequence is reported, its remaining bytes are discarded without producing events
 /// until its closing marker arrives. Call this function again to determine whether it has finished.
+///
+/// Drop or pause all active `EventStream`s and other blocking event-reader users before calling this
+/// function. Event readers share a global lock, so a concurrently blocked reader can prevent it from
+/// returning.
 #[cfg(unix)]
 pub fn discard_buffered_input() -> std::io::Result<InputDiscardStatus> {
     lock_internal_event_reader().discard_buffered_input()

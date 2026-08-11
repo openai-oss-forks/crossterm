@@ -385,6 +385,9 @@ impl Parser {
                     DiscardedSequence::PasteStart(2) if *byte == b'M' => {
                         Some(DiscardedSequence::X10Mouse(3))
                     }
+                    DiscardedSequence::PasteStart(2) if *byte == b'[' => {
+                        Some(DiscardedSequence::Csi)
+                    }
                     DiscardedSequence::PasteStart(matched)
                         if matched >= 2 && !(0x40..=0x7e).contains(byte) =>
                     {
@@ -541,7 +544,10 @@ mod tests {
             parser.advance(std::slice::from_ref(&suffix), false);
 
             assert_eq!(parser.next(), None);
-            assert_eq!(parser.discard_buffered_input(), InputDiscardStatus::Complete);
+            assert_eq!(
+                parser.discard_buffered_input(),
+                InputDiscardStatus::Complete
+            );
         }
     }
 
@@ -595,7 +601,10 @@ mod tests {
             for boundary in 1..sequence.len() {
                 let mut parser = Parser::default();
                 parser.advance(&sequence[..boundary], true);
-                assert_ne!(parser.discard_buffered_input(), InputDiscardStatus::Complete);
+                assert_ne!(
+                    parser.discard_buffered_input(),
+                    InputDiscardStatus::Complete
+                );
 
                 let remainder = &sequence[boundary..];
                 for (index, byte) in remainder.iter().enumerate() {
@@ -684,6 +693,51 @@ mod tests {
             parser.next(),
             Some(InternalEvent::Event(Event::Mouse(_)))
         ));
+    }
+
+    #[test]
+    fn discarded_double_bracket_csi_suppresses_its_delayed_suffix() {
+        for (suffix, completion) in [
+            (b"[A".as_slice(), b"".as_slice()),
+            (b"[B".as_slice(), b"".as_slice()),
+            (b"[C".as_slice(), b"".as_slice()),
+            (b"[D".as_slice(), b"".as_slice()),
+            (b"[E".as_slice(), b"".as_slice()),
+            (b"[y".as_slice(), b"".as_slice()),
+            (b"[1".as_slice(), b"A".as_slice()),
+            (b"[1y".as_slice(), b"".as_slice()),
+        ] {
+            let mut sequence = b"\x1b[".to_vec();
+            sequence.extend_from_slice(suffix);
+            for boundary in 1..sequence.len().min(4) {
+                let mut parser = Parser::default();
+                parser.advance(&sequence[..boundary], true);
+                assert_ne!(
+                    parser.discard_buffered_input(),
+                    InputDiscardStatus::Complete
+                );
+
+                parser.advance(&sequence[boundary..], true);
+                assert_eq!(parser.next(), None);
+                if !completion.is_empty() {
+                    assert_eq!(
+                        parser.discard_buffered_input(),
+                        InputDiscardStatus::ControlSequenceInProgress
+                    );
+                    parser.advance(completion, true);
+                }
+                assert_eq!(
+                    parser.discard_buffered_input(),
+                    InputDiscardStatus::Complete
+                );
+
+                parser.advance(b"n", false);
+                assert_eq!(
+                    parser.next(),
+                    Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into())))
+                );
+            }
+        }
     }
 
     #[test]
