@@ -4,6 +4,8 @@
 
 - Query terminal default colors via OSC 10/11 on Unix using `query_foreground_color` and
   `query_background_color`.
+- Request terminal default colors without blocking and receive the OSC 10/11 responses through
+  the public event stream.
 
 # Version 0.29
 
