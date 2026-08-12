@@ -23,6 +23,16 @@ pub fn query_background_color() -> io::Result<Option<Color>> {
     query_color_slot(11)
 }
 
+/// Requests the terminal's current default foreground and background colors without waiting.
+///
+/// The responses are delivered as [`crate::event::Event::ColorQueryResponse`] events, allowing
+/// callers that use [`crate::event::EventStream`] to refresh colors without blocking input.
+#[cfg(all(unix, feature = "events"))]
+pub fn request_default_colors() -> io::Result<()> {
+    send_query(10)?;
+    send_query(11)
+}
+
 #[cfg(all(unix, feature = "events"))]
 fn query_color_slot(slot: u8) -> io::Result<Option<Color>> {
     if crate::terminal::sys::is_raw_mode_enabled() {
@@ -97,5 +107,13 @@ pub fn query_background_color() -> io::Result<Option<Color>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "query_background_color requires the \"events\" feature on Unix platforms",
+    ))
+}
+
+#[cfg(not(all(unix, feature = "events")))]
+pub fn request_default_colors() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "request_default_colors requires the \"events\" feature on Unix platforms",
     ))
 }

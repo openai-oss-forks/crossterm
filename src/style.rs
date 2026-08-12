@@ -145,7 +145,7 @@ mod stylize;
 mod sys;
 mod types;
 #[cfg(feature = "events")]
-pub use query::{query_background_color, query_foreground_color};
+pub use query::{query_background_color, query_foreground_color, request_default_colors};
 
 /// Creates a `StyledContent`.
 ///

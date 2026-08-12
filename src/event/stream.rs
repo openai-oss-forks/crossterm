@@ -15,7 +15,7 @@ use futures_core::stream::Stream;
 
 use crate::event::{
     filter::EventFilter, lock_internal_event_reader, poll_internal, read_internal, sys::Waker,
-    Event, InternalEvent,
+    Event,
 };
 
 /// A stream of `Result<Event>`.
@@ -103,11 +103,16 @@ impl Stream for EventStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let result = match poll_internal(Some(Duration::from_secs(0)), &EventFilter) {
-            Ok(true) => match read_internal(&EventFilter) {
-                Ok(InternalEvent::Event(event)) => Poll::Ready(Some(Ok(event))),
+            Ok(true) => match read_internal(&EventFilter).and_then(|event| {
+                event.into_public_event().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        "event filter returned a private terminal event",
+                    )
+                })
+            }) {
+                Ok(event) => Poll::Ready(Some(Ok(event))),
                 Err(e) => Poll::Ready(Some(Err(e))),
-                #[cfg(unix)]
-                _ => unreachable!(),
             },
             Ok(false) => {
                 if !self

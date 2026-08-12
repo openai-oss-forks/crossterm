@@ -54,6 +54,7 @@
 //!             #[cfg(feature = "bracketed-paste")]
 //!             Event::Paste(data) => println!("{:?}", data),
 //!             Event::Resize(width, height) => println!("New size {}x{}", width, height),
+//!             Event::ColorQueryResponse(response) => println!("Color response: {:?}", response),
 //!         }
 //!     }
 //!     execute!(
@@ -100,6 +101,7 @@
 //!                 #[cfg(feature = "bracketed-paste")]
 //!                 Event::Paste(data) => println!("Pasted {:?}", data),
 //!                 Event::Resize(width, height) => println!("New size {}x{}", width, height),
+//!                 Event::ColorQueryResponse(response) => println!("Color response: {:?}", response),
 //!             }
 //!         } else {
 //!             // Timeout expired and no `Event` is available
@@ -136,6 +138,7 @@ use crate::event::{
     read::InternalEventReader,
     timeout::PollTimeout,
 };
+use crate::style::Color;
 use crate::{csi, Command};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use std::fmt::{self, Display};
@@ -247,11 +250,14 @@ pub fn poll(timeout: Duration) -> std::io::Result<bool> {
 /// }
 /// ```
 pub fn read() -> std::io::Result<Event> {
-    match read_internal(&EventFilter)? {
-        InternalEvent::Event(event) => Ok(event),
-        #[cfg(unix)]
-        _ => unreachable!(),
-    }
+    read_internal(&EventFilter)?
+        .into_public_event()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "event filter returned a private terminal event",
+            )
+        })
 }
 
 /// Polls to check if there are any `InternalEvent`s that can be read within the given duration.
@@ -563,6 +569,19 @@ pub enum Event {
     /// An resize event with new dimensions after resize (columns, rows).
     /// **Note** that resize events can occur in batches.
     Resize(u16, u16),
+    /// A response to an asynchronous terminal default-color request.
+    ColorQueryResponse(ColorQueryResponse),
+}
+
+/// The terminal color returned by an OSC 10 or OSC 11 query.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "derive-more", derive(IsVariant))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum ColorQueryResponse {
+    /// The terminal's default foreground color (OSC 10).
+    Foreground(Option<Color>),
+    /// The terminal's default background color (OSC 11).
+    Background(Option<Color>),
 }
 
 impl Event {
@@ -1489,6 +1508,32 @@ pub(crate) enum InternalEvent {
     OscColor { slot: u8, payload: OscColorPayload },
 }
 
+impl InternalEvent {
+    pub(crate) fn into_public_event(self) -> Option<Event> {
+        match self {
+            Self::Event(event) => Some(event),
+            #[cfg(unix)]
+            Self::OscColor { slot, payload } => {
+                let color = match payload {
+                    OscColorPayload::Rgb { r, g, b } => Some(Color::Rgb { r, g, b }),
+                    OscColorPayload::Unrecognized(_) => None,
+                };
+                match slot {
+                    10 => Some(Event::ColorQueryResponse(ColorQueryResponse::Foreground(
+                        color,
+                    ))),
+                    11 => Some(Event::ColorQueryResponse(ColorQueryResponse::Background(
+                        color,
+                    ))),
+                    _ => None,
+                }
+            }
+            #[cfg(unix)]
+            _ => None,
+        }
+    }
+}
+
 /// Parsed payload of an OSC color response.
 #[cfg(unix)]
 #[derive(Debug, PartialOrd, PartialEq, Hash, Clone, Eq)]
@@ -1508,6 +1553,31 @@ mod tests {
     use KeyCode::*;
     use MediaKeyCode::*;
     use ModifierKeyCode::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn osc_color_responses_become_public_events() {
+        assert_eq!(
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
+            }
+            .into_public_event(),
+            Some(Event::ColorQueryResponse(ColorQueryResponse::Foreground(
+                Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            )))
+        );
+        assert_eq!(
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Unrecognized("transparent".to_string()),
+            }
+            .into_public_event(),
+            Some(Event::ColorQueryResponse(ColorQueryResponse::Background(
+                None,
+            )))
+        );
+    }
 
     #[test]
     fn test_equality() {
