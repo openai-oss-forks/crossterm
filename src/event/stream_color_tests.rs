@@ -55,7 +55,7 @@ fn extracts_color_reports_without_splitting_pasted_text() {
                     b: 51
                 },
             },
-            InternalEvent::Event(Event::Paste("α βγ".to_string())),
+            InternalEvent::ProcessedPaste("α βγ".to_string()),
         ]
     );
 }

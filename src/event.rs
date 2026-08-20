@@ -1520,6 +1520,9 @@ impl Display for KeyCode {
 pub(crate) enum InternalEvent {
     /// An event.
     Event(Event),
+    /// A paste already scanned for color reports. Its retained text must not be scanned again.
+    #[cfg(all(unix, feature = "event-stream", feature = "bracketed-paste"))]
+    ProcessedPaste(String),
     /// A cursor position (`col`, `row`).
     #[cfg(unix)]
     CursorPosition(u16, u16),

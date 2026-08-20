@@ -125,7 +125,7 @@ pub(in crate::event) fn extract_paste_colors(text: String, pending: &mut VecDequ
         pending.push_back(InternalEvent::Event(Event::Paste(text)));
     } else {
         retained.push_str(&text[copied..]);
-        pending.push_back(InternalEvent::Event(Event::Paste(retained)));
+        pending.push_back(InternalEvent::ProcessedPaste(retained));
     }
 }
 
