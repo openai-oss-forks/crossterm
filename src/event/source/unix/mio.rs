@@ -35,7 +35,7 @@ pub(crate) struct UnixInternalEventSource {
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
-    pending_tty_readable: bool,
+    pending_tokens: VecDeque<Token>,
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
@@ -66,7 +66,7 @@ impl UnixInternalEventSource {
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
-            pending_tty_readable: false,
+            pending_tokens: VecDeque::with_capacity(3),
             signals,
             #[cfg(feature = "event-stream")]
             waker,
@@ -82,9 +82,7 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if self.pending_tty_readable {
-                self.pending_tty_readable = false;
-            } else {
+            if self.pending_tokens.is_empty() {
                 let poll_timeout = self.parser.poll_timeout(timeout.leftover());
                 if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
                     // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
@@ -101,9 +99,13 @@ impl EventSource for UnixInternalEventSource {
                     // No readiness events = timeout
                     return Ok(self.parser.finish_pending_escape());
                 }
+                self.pending_tokens
+                    .extend(self.events.iter().map(|event| event.token()));
             }
 
-            for token in self.events.iter().map(|x| x.token()) {
+            // Mio readiness is edge-triggered. Retain unprocessed tokens across early returns,
+            // especially when a stream's wakeup arrives in the same poll as terminal input.
+            while let Some(token) = self.pending_tokens.pop_front() {
                 match token {
                     TTY_TOKEN => {
                         loop {
@@ -125,18 +127,21 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
-                            if let Some(event) = self.parser.next() {
-                                return Ok(Some(event));
-                            }
-
                             // The source owns this descriptor for the lifetime of its borrow.
                             let fd =
                                 unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
-                            if rustix::io::ioctl_fionread(fd)? == 0 {
+                            let input_available = rustix::io::ioctl_fionread(fd)? != 0;
+                            if let Some(event) = self.parser.next() {
+                                if input_available {
+                                    self.pending_tokens.push_front(TTY_TOKEN);
+                                }
+                                return Ok(Some(event));
+                            }
+                            if !input_available {
                                 break;
                             }
                             if timeout.elapsed() {
-                                self.pending_tty_readable = true;
+                                self.pending_tokens.push_front(TTY_TOKEN);
                                 return Ok(self.parser.finish_pending_escape());
                             }
                         }
@@ -492,6 +497,26 @@ mod tests {
         assert_eq!(
             source.discard_buffered_input(),
             InputDiscardStatus::Complete
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "event-stream")]
+    fn stream_wakeup_preserves_simultaneous_input_readiness() {
+        let (mut source, mut writer) = source_with_input();
+        source.waker().wake().unwrap();
+        writer.write_all(b"x").unwrap();
+
+        let first = source.try_read(Some(Duration::from_millis(100)));
+        let event = match first {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                source.try_read(Some(Duration::from_millis(100))).unwrap()
+            }
+            result => result.unwrap(),
+        };
+        assert_eq!(
+            event,
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('x').into())))
         );
     }
 
@@ -946,7 +971,7 @@ mod tests {
                 source.try_read(Some(Duration::from_millis(10))).unwrap(),
                 None
             );
-            assert!(source.pending_tty_readable);
+            assert!(source.pending_tokens.contains(&super::TTY_TOKEN));
             assert_eq!(
                 source.discard_buffered_input(),
                 InputDiscardStatus::BracketedPasteInProgress
