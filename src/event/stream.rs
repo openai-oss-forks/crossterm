@@ -14,9 +14,34 @@ use std::{
 use futures_core::stream::Stream;
 
 use crate::event::{
-    filter::EventFilter, lock_internal_event_reader, poll_internal, read_internal, sys::Waker,
+    filter::{EventFilter, Filter},
+    lock_internal_event_reader, poll_internal, read_internal,
+    sys::Waker,
     Event, InternalEvent,
 };
+
+#[path = "stream_color.rs"]
+mod color;
+pub use color::{ColorEventStream, EventWithColor};
+
+#[derive(Debug, Clone, Copy)]
+enum StreamFilter {
+    Input,
+    InputAndColors,
+}
+
+impl Filter for StreamFilter {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        if EventFilter.eval(event) {
+            return true;
+        }
+        #[cfg(unix)]
+        if matches!(self, Self::InputAndColors) {
+            return color::color_report(event).is_some();
+        }
+        false
+    }
+}
 
 /// A stream of `Result<Event>`.
 ///
@@ -31,6 +56,7 @@ use crate::event::{
 /// it (`event-stream-*`).
 #[derive(Debug)]
 pub struct EventStream {
+    filter: StreamFilter,
     poll_internal_waker: Waker,
     stream_wake_task_executed: Arc<AtomicBool>,
     stream_wake_task_should_shutdown: Arc<AtomicBool>,
@@ -39,12 +65,18 @@ pub struct EventStream {
 
 impl Default for EventStream {
     fn default() -> Self {
+        Self::with_filter(StreamFilter::Input)
+    }
+}
+
+impl EventStream {
+    fn with_filter(filter: StreamFilter) -> Self {
         let (task_sender, receiver) = mpsc::sync_channel::<Task>(1);
 
         thread::spawn(move || {
             while let Ok(task) = receiver.recv() {
                 loop {
-                    if let Ok(true) = poll_internal(None, &EventFilter) {
+                    if let Ok(true) = poll_internal(None, &filter) {
                         break;
                     }
 
@@ -59,6 +91,7 @@ impl Default for EventStream {
         });
 
         EventStream {
+            filter,
             poll_internal_waker: lock_internal_event_reader().waker(),
             stream_wake_task_executed: Arc::new(AtomicBool::new(false)),
             stream_wake_task_should_shutdown: Arc::new(AtomicBool::new(false)),
@@ -71,6 +104,15 @@ impl EventStream {
     /// Constructs a new instance of `EventStream`.
     pub fn new() -> EventStream {
         EventStream::default()
+    }
+
+    /// Receive OSC 10/11 color reports alongside ordinary input through the same reader.
+    ///
+    /// This does not send terminal queries. The returned stream also extracts valid color
+    /// reports interleaved with bracketed paste, preserving the remaining text as one paste.
+    /// Ordinary `EventStream`, `read`, and `poll` behavior is unchanged.
+    pub fn with_color_reports() -> ColorEventStream {
+        ColorEventStream::new(Self::with_filter(StreamFilter::InputAndColors))
     }
 }
 
@@ -102,13 +144,25 @@ impl Stream for EventStream {
     type Item = io::Result<Event>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = match poll_internal(Some(Duration::from_secs(0)), &EventFilter) {
-            Ok(true) => match read_internal(&EventFilter) {
-                Ok(InternalEvent::Event(event)) => Poll::Ready(Some(Ok(event))),
-                Err(e) => Poll::Ready(Some(Err(e))),
-                #[cfg(unix)]
-                _ => unreachable!(),
-            },
+        self.get_mut().poll_internal_event(cx).map(|event| {
+            event.map(|event| {
+                event.map(|event| match event {
+                    InternalEvent::Event(event) => event,
+                    #[cfg(unix)]
+                    _ => unreachable!(),
+                })
+            })
+        })
+    }
+}
+
+impl EventStream {
+    fn poll_internal_event(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<io::Result<InternalEvent>>> {
+        let result = match poll_internal(Some(Duration::from_secs(0)), &self.filter) {
+            Ok(true) => Poll::Ready(Some(read_internal(&self.filter))),
             Ok(false) => {
                 if !self
                     .stream_wake_task_executed
