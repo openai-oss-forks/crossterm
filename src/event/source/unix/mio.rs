@@ -35,7 +35,7 @@ pub(crate) struct UnixInternalEventSource {
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
-    pending_tty_readable: bool,
+    pending_tokens: VecDeque<Token>,
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
@@ -66,7 +66,7 @@ impl UnixInternalEventSource {
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
-            pending_tty_readable: false,
+            pending_tokens: VecDeque::with_capacity(3),
             signals,
             #[cfg(feature = "event-stream")]
             waker,
@@ -82,9 +82,7 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if self.pending_tty_readable {
-                self.pending_tty_readable = false;
-            } else {
+            if self.pending_tokens.is_empty() {
                 let poll_timeout = self.parser.poll_timeout(timeout.leftover());
                 if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
                     // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
@@ -101,19 +99,30 @@ impl EventSource for UnixInternalEventSource {
                     // No readiness events = timeout
                     return Ok(self.parser.finish_pending_escape());
                 }
+                self.pending_tokens
+                    .extend(self.events.iter().map(|event| event.token()));
             }
 
-            for token in self.events.iter().map(|x| x.token()) {
+            // Mio readiness is edge-triggered. Retain unprocessed tokens across early returns,
+            // especially when a stream's wakeup arrives in the same poll as terminal input.
+            while let Some(token) = self.pending_tokens.pop_front() {
                 match token {
                     TTY_TOKEN => {
                         loop {
-                            match self.tty_fd.read(&mut self.tty_buffer) {
+                            // A saved readiness notification can outlive the bytes it describes:
+                            // an external terminal owner may have read or flushed them. Recheck
+                            // before reading the potentially blocking, shared descriptor.
+                            let fd =
+                                unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
+                            let available = rustix::io::ioctl_fionread(fd)?;
+                            if available == 0 {
+                                break;
+                            }
+                            let read_len = self.tty_buffer.len().min(available as usize);
+                            match self.tty_fd.read(&mut self.tty_buffer[..read_len]) {
                                 Ok(read_count) => {
                                     if read_count > 0 {
-                                        self.parser.advance(
-                                            &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
-                                        );
+                                        self.parser.advance_input(&self.tty_buffer[..read_count]);
                                     }
                                 }
                                 Err(e) => {
@@ -128,18 +137,18 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
+                            let input_available = rustix::io::ioctl_fionread(fd)? != 0;
                             if let Some(event) = self.parser.next() {
+                                if input_available {
+                                    self.pending_tokens.push_front(TTY_TOKEN);
+                                }
                                 return Ok(Some(event));
                             }
-
-                            // The source owns this descriptor for the lifetime of its borrow.
-                            let fd =
-                                unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
-                            if rustix::io::ioctl_fionread(fd)? == 0 {
+                            if !input_available {
                                 break;
                             }
                             if timeout.elapsed() {
-                                self.pending_tty_readable = true;
+                                self.pending_tokens.push_front(TTY_TOKEN);
                                 return Ok(self.parser.finish_pending_escape());
                             }
                         }
@@ -178,7 +187,7 @@ impl EventSource for UnixInternalEventSource {
     }
 
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>) {
-        self.parser.buffer_external_input(input);
+        self.parser.advance_input(input);
         events.extend(
             self.parser
                 .by_ref()
@@ -284,7 +293,9 @@ impl Parser {
         }
     }
 
-    fn buffer_external_input(&mut self, buffer: &[u8]) {
+    /// Give live and replayed input the same bounded Escape continuation window: a read
+    /// boundary does not distinguish an Escape key from the start of a control sequence.
+    fn advance_input(&mut self, buffer: &[u8]) {
         self.advance(buffer, true);
         if self.buffer.as_slice() == b"\x1b" {
             self.pending_escape_deadline = Some(Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
@@ -391,6 +402,15 @@ impl Parser {
             }
             let more = idx + 1 < buffer.len() || more;
 
+            // The second Escape starts its own key or control sequence. The stateless
+            // parser's ESC ESC case would otherwise consume both as a single key.
+            if self.buffer.as_slice() == b"\x1b" && *byte == b'\x1b' {
+                self.internal_events
+                    .push_back(InternalEvent::Event(Event::Key(
+                        crate::event::KeyCode::Esc.into(),
+                    )));
+                self.buffer.clear();
+            }
             self.buffer.push(*byte);
 
             match parse_event(&self.buffer, more) {
@@ -455,9 +475,138 @@ mod tests {
     }
 
     #[test]
+    fn live_color_report_can_split_after_escape() {
+        use crate::event::OscColorPayload;
+
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"\x1b").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(1))).unwrap(),
+            None
+        );
+        writer.write_all(b"]11;rgb:11/22/33\x07z").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb {
+                    r: 17,
+                    g: 34,
+                    b: 51
+                },
+            })
+        );
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('z').into())))
+        );
+    }
+
+    #[test]
+    fn separate_live_escape_presses_are_preserved() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"\x1b").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(1))).unwrap(),
+            None
+        );
+        writer.write_all(b"\x1b").unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                source.try_read(Some(Duration::from_millis(100))).unwrap(),
+                Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+            );
+        }
+    }
+
+    #[test]
+    fn escape_before_a_control_sequence_preserves_both_events() {
+        let input = b"\x1b\x1b[A";
+        for split in 1..input.len() {
+            let mut parser = Parser::default();
+            parser.advance_input(&input[..split]);
+            parser.advance_input(&input[split..]);
+            assert_eq!(
+                parser.collect::<Vec<_>>(),
+                vec![
+                    InternalEvent::Event(Event::Key(KeyCode::Esc.into())),
+                    InternalEvent::Event(Event::Key(KeyCode::Up.into())),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_live_escape_has_a_bounded_wait() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"\x1b").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+        );
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::Complete
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "event-stream")]
+    fn stream_wakeup_preserves_simultaneous_input_readiness() {
+        let (mut source, mut writer) = source_with_input();
+        source.waker().wake().unwrap();
+        writer.write_all(b"x").unwrap();
+
+        let first = source.try_read(Some(Duration::from_millis(100)));
+        let event = match first {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                source.try_read(Some(Duration::from_millis(100))).unwrap()
+            }
+            result => result.unwrap(),
+        };
+        assert_eq!(
+            event,
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('x').into())))
+        );
+    }
+
+    #[test]
+    fn stale_readiness_after_external_read_respects_poll_timeout() {
+        let (mut source, mut writer) = source_with_input();
+        writer
+            .write_all(&[b'x'; super::TTY_BUFFER_SIZE * 2])
+            .unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('x').into())))
+        );
+        assert!(source.pending_tokens.contains(&super::TTY_TOKEN));
+
+        // An external terminal owner consumes the unread bytes before the stream resumes.
+        let mut external_input = [0; super::TTY_BUFFER_SIZE];
+        assert_eq!(
+            source.tty_fd.read(&mut external_input).unwrap(),
+            external_input.len()
+        );
+        source.discard_buffered_input();
+
+        // Rescue an incorrectly blocking read so this regression fails instead of hanging.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let rescue = std::thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_millis(100)).is_err() {
+                writer.write_all(b"z").unwrap();
+            }
+        });
+        let event = source.try_read(Some(Duration::from_millis(20))).unwrap();
+        let _ = done_tx.send(());
+        rescue.join().unwrap();
+        assert_eq!(event, None);
+    }
+
+    #[test]
     fn externally_buffered_escape_remains_available_for_its_continuation() {
         let mut parser = Parser::default();
-        parser.buffer_external_input(b"\x1b");
+        parser.advance_input(b"\x1b");
         assert_eq!(parser.next(), None);
 
         parser.advance(b"[A", false);
@@ -470,7 +619,7 @@ mod tests {
     #[test]
     fn standalone_buffered_escape_is_emitted_after_its_ambiguity_window() {
         let mut parser = Parser::default();
-        parser.buffer_external_input(b"\x1b");
+        parser.advance_input(b"\x1b");
         assert_eq!(parser.finish_pending_escape(), None);
 
         parser.pending_escape_deadline = Some(Instant::now());
@@ -484,7 +633,7 @@ mod tests {
     fn discarded_escape_suppresses_a_delayed_modifier_suffix() {
         for suffix in [b'y', b'1'] {
             let mut parser = Parser::default();
-            parser.buffer_external_input(b"\x1b");
+            parser.advance_input(b"\x1b");
             parser.pending_escape_deadline = Some(Instant::now());
 
             assert_eq!(
@@ -806,7 +955,7 @@ mod tests {
     #[test]
     fn expired_buffered_escape_reads_already_available_continuation_first() {
         let (mut source, mut writer) = source_with_input();
-        source.parser.buffer_external_input(b"\x1b");
+        source.parser.advance_input(b"\x1b");
         source.parser.pending_escape_deadline = Some(Instant::now());
         writer.write_all(b"[A").unwrap();
 
@@ -819,7 +968,7 @@ mod tests {
     #[test]
     fn expired_buffered_escape_remains_usable_without_a_continuation() {
         let (mut source, _writer) = source_with_input();
-        source.parser.buffer_external_input(b"\x1b");
+        source.parser.advance_input(b"\x1b");
         source.parser.pending_escape_deadline = Some(Instant::now());
 
         assert_eq!(
@@ -905,7 +1054,7 @@ mod tests {
                 source.try_read(Some(Duration::from_millis(10))).unwrap(),
                 None
             );
-            assert!(source.pending_tty_readable);
+            assert!(source.pending_tokens.contains(&super::TTY_TOKEN));
             assert_eq!(
                 source.discard_buffered_input(),
                 InputDiscardStatus::BracketedPasteInProgress
