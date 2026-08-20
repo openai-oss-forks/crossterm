@@ -70,6 +70,7 @@ impl Default for EventStream {
 }
 
 impl EventStream {
+    /// Use the same event filter for foreground reads and background wakeups.
     fn with_filter(filter: StreamFilter) -> Self {
         let (task_sender, receiver) = mpsc::sync_channel::<Task>(1);
 
@@ -108,9 +109,10 @@ impl EventStream {
 
     /// Receive OSC 10/11 color reports alongside ordinary input through the same reader.
     ///
-    /// This does not send terminal queries. The returned stream also extracts valid color
-    /// reports interleaved with bracketed paste, preserving the remaining text as one paste.
-    /// Ordinary `EventStream`, `read`, and `poll` behavior is unchanged.
+    /// This does not send terminal queries. On Unix, the returned stream also extracts valid
+    /// RGB color reports interleaved with bracketed paste, preserving the remaining text as one
+    /// paste. Literal pasted reports cannot be distinguished from terminal replies.
+    /// Ordinary readers do not expose color reports, and the public [`Event`] enum is unchanged.
     pub fn with_color_reports() -> ColorEventStream {
         ColorEventStream::new(Self::with_filter(StreamFilter::InputAndColors))
     }
@@ -157,11 +159,12 @@ impl Stream for EventStream {
 }
 
 impl EventStream {
+    /// Poll the shared reader, scheduling a matching background wakeup when no event is ready.
     fn poll_internal_event(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<io::Result<InternalEvent>>> {
-        let result = match poll_internal(Some(Duration::from_secs(0)), &self.filter) {
+        match poll_internal(Some(Duration::from_secs(0)), &self.filter) {
             Ok(true) => {
                 let mut reader = lock_internal_event_reader();
                 #[cfg(all(unix, feature = "bracketed-paste"))]
@@ -193,8 +196,7 @@ impl EventStream {
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Some(Err(e))),
-        };
-        result
+        }
     }
 }
 

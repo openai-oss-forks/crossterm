@@ -31,10 +31,8 @@ fn color_reports_are_opt_in_and_require_valid_rgb() {
 #[cfg(feature = "bracketed-paste")]
 #[test]
 fn extracts_color_reports_without_splitting_pasted_text() {
-    let mut events = VecDeque::new();
-    extract_paste_colors(
+    let events = extract_paste_colors(
         "α\x1b]10;rgb:eeee/eeee/eeee\x07 β\x1b]11;rgb:11/22/33\x1b\\γ".to_string(),
-        &mut events,
     );
     assert_eq!(
         events.into_iter().collect::<Vec<_>>(),
@@ -69,10 +67,10 @@ fn preserves_unrelated_malformed_and_incomplete_paste_sequences() {
         "\x1b]11;rgb:11/22/33\x1b".to_string(),
         format!("\x1b]10;{}\x07", "x".repeat(2048)),
     ] {
-        let mut events = VecDeque::new();
-        extract_paste_colors(text.clone(), &mut events);
         assert_eq!(
-            events.into_iter().collect::<Vec<_>>(),
+            extract_paste_colors(text.clone())
+                .into_iter()
+                .collect::<Vec<_>>(),
             vec![InternalEvent::Event(Event::Paste(text))]
         );
     }

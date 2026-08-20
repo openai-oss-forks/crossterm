@@ -293,8 +293,8 @@ impl Parser {
         }
     }
 
-    // A read boundary does not distinguish Escape from the start of a control sequence.
-    // Give both live and replayed input the same bounded continuation window.
+    /// Give live and replayed input the same bounded Escape continuation window: a read
+    /// boundary does not distinguish an Escape key from the start of a control sequence.
     fn advance_input(&mut self, buffer: &[u8]) {
         self.advance(buffer, true);
         if self.buffer.as_slice() == b"\x1b" {

@@ -66,6 +66,7 @@ impl Stream for ColorEventStream {
     }
 }
 
+/// Recognize only valid RGB reports for the default foreground and background slots.
 #[cfg(unix)]
 pub(super) fn color_report(event: &InternalEvent) -> Option<EventWithColor> {
     use crate::event::OscColorPayload;
@@ -88,9 +89,14 @@ pub(super) fn color_report(event: &InternalEvent) -> Option<EventWithColor> {
     }
 }
 
+/// Return bounded, valid color reports in encounter order, followed by exactly one paste.
+///
+/// Leave unrelated, malformed, and incomplete sequences intact. Mark changed text so removing
+/// one report cannot expose a new apparent report on a later read.
 #[cfg(all(unix, feature = "bracketed-paste"))]
-pub(in crate::event) fn extract_paste_colors(text: String, pending: &mut VecDeque<InternalEvent>) {
+pub(in crate::event) fn extract_paste_colors(text: String) -> VecDeque<InternalEvent> {
     const MAX_COLOR_REPORT_BYTES: usize = 1024;
+    let mut pending = VecDeque::new();
     let bytes = text.as_bytes();
     let mut retained = String::new();
     let mut copied = 0;
@@ -127,6 +133,7 @@ pub(in crate::event) fn extract_paste_colors(text: String, pending: &mut VecDequ
         retained.push_str(&text[copied..]);
         pending.push_back(InternalEvent::ProcessedPaste(retained));
     }
+    pending
 }
 
 #[cfg(all(test, unix))]

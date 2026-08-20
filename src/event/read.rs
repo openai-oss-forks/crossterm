@@ -123,6 +123,7 @@ impl InternalEventReader {
         self.read_queued(filter).map(unwrap_processed_paste)
     }
 
+    /// Read a matching event without erasing the marker on an already-scanned paste.
     fn read_queued<F>(&mut self, filter: &F) -> io::Result<InternalEvent>
     where
         F: Filter,
@@ -153,27 +154,30 @@ impl InternalEventReader {
         }
     }
 
-    /// Keep input extracted from a paste in the shared queue so replacing a stream cannot
-    /// discard the remainder of an event that has already been read from the terminal.
+    /// Extract color reports once, before delivering the retained text as one paste.
+    ///
+    /// Keep the remaining events in the shared queue so replacing a stream cannot lose input.
+    /// Preserve processed-paste markers until delivery to avoid interpreting text exposed by
+    /// an earlier extraction as another terminal reply.
     #[cfg(all(unix, feature = "event-stream", feature = "bracketed-paste"))]
     pub(crate) fn read_with_color_reports<F>(&mut self, filter: &F) -> io::Result<InternalEvent>
     where
         F: Filter,
     {
         let event = self.read_queued(filter)?;
-        if let InternalEvent::Event(crate::event::Event::Paste(text)) = event {
-            let mut extracted = VecDeque::new();
-            crate::event::stream::color::extract_paste_colors(text, &mut extracted);
+        let event = if let InternalEvent::Event(crate::event::Event::Paste(text)) = event {
+            let mut extracted = crate::event::stream::color::extract_paste_colors(text);
             let first = extracted
                 .pop_front()
                 .expect("paste extraction retains a paste");
             while let Some(event) = extracted.pop_back() {
                 self.events.push_front(event);
             }
-            Ok(unwrap_processed_paste(first))
+            first
         } else {
-            Ok(unwrap_processed_paste(event))
-        }
+            event
+        };
+        Ok(unwrap_processed_paste(event))
     }
 }
 
