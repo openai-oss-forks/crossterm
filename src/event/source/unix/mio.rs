@@ -402,6 +402,15 @@ impl Parser {
             }
             let more = idx + 1 < buffer.len() || more;
 
+            // The second Escape starts its own key or control sequence. The stateless
+            // parser's ESC ESC case would otherwise consume both as a single key.
+            if self.buffer.as_slice() == b"\x1b" && *byte == b'\x1b' {
+                self.internal_events
+                    .push_back(InternalEvent::Event(Event::Key(
+                        crate::event::KeyCode::Esc.into(),
+                    )));
+                self.buffer.clear();
+            }
             self.buffer.push(*byte);
 
             match parse_event(&self.buffer, more) {
@@ -491,6 +500,40 @@ mod tests {
             source.try_read(Some(Duration::from_millis(100))).unwrap(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Char('z').into())))
         );
+    }
+
+    #[test]
+    fn separate_live_escape_presses_are_preserved() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"\x1b").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(1))).unwrap(),
+            None
+        );
+        writer.write_all(b"\x1b").unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                source.try_read(Some(Duration::from_millis(100))).unwrap(),
+                Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+            );
+        }
+    }
+
+    #[test]
+    fn escape_before_a_control_sequence_preserves_both_events() {
+        let input = b"\x1b\x1b[A";
+        for split in 1..input.len() {
+            let mut parser = Parser::default();
+            parser.advance_input(&input[..split]);
+            parser.advance_input(&input[split..]);
+            assert_eq!(
+                parser.collect::<Vec<_>>(),
+                vec![
+                    InternalEvent::Event(Event::Key(KeyCode::Esc.into())),
+                    InternalEvent::Event(Event::Key(KeyCode::Up.into())),
+                ]
+            );
+        }
     }
 
     #[test]
