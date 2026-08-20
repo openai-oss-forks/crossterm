@@ -109,7 +109,17 @@ impl EventSource for UnixInternalEventSource {
                 match token {
                     TTY_TOKEN => {
                         loop {
-                            match self.tty_fd.read(&mut self.tty_buffer) {
+                            // A saved readiness notification can outlive the bytes it describes:
+                            // an external terminal owner may have read or flushed them. Recheck
+                            // before reading the potentially blocking, shared descriptor.
+                            let fd =
+                                unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
+                            let available = rustix::io::ioctl_fionread(fd)?;
+                            if available == 0 {
+                                break;
+                            }
+                            let read_len = self.tty_buffer.len().min(available as usize);
+                            match self.tty_fd.read(&mut self.tty_buffer[..read_len]) {
                                 Ok(read_count) => {
                                     if read_count > 0 {
                                         self.parser.advance_input(&self.tty_buffer[..read_count]);
@@ -127,9 +137,6 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
-                            // The source owns this descriptor for the lifetime of its borrow.
-                            let fd =
-                                unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
                             let input_available = rustix::io::ioctl_fionread(fd)? != 0;
                             if let Some(event) = self.parser.next() {
                                 if input_available {
@@ -518,6 +525,39 @@ mod tests {
             event,
             Some(InternalEvent::Event(Event::Key(KeyCode::Char('x').into())))
         );
+    }
+
+    #[test]
+    fn stale_readiness_after_external_read_respects_poll_timeout() {
+        let (mut source, mut writer) = source_with_input();
+        writer
+            .write_all(&[b'x'; super::TTY_BUFFER_SIZE * 2])
+            .unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('x').into())))
+        );
+        assert!(source.pending_tokens.contains(&super::TTY_TOKEN));
+
+        // An external terminal owner consumes the unread bytes before the stream resumes.
+        let mut external_input = [0; super::TTY_BUFFER_SIZE];
+        assert_eq!(
+            source.tty_fd.read(&mut external_input).unwrap(),
+            external_input.len()
+        );
+        source.discard_buffered_input();
+
+        // Rescue an incorrectly blocking read so this regression fails instead of hanging.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let rescue = std::thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_millis(100)).is_err() {
+                writer.write_all(b"z").unwrap();
+            }
+        });
+        let event = source.try_read(Some(Duration::from_millis(20))).unwrap();
+        let _ = done_tx.send(());
+        rescue.join().unwrap();
+        assert_eq!(event, None);
     }
 
     #[test]
