@@ -110,10 +110,7 @@ impl EventSource for UnixInternalEventSource {
                             match self.tty_fd.read(&mut self.tty_buffer) {
                                 Ok(read_count) => {
                                     if read_count > 0 {
-                                        self.parser.advance(
-                                            &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
-                                        );
+                                        self.parser.advance_input(&self.tty_buffer[..read_count]);
                                     }
                                 }
                                 Err(e) => {
@@ -178,7 +175,7 @@ impl EventSource for UnixInternalEventSource {
     }
 
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>) {
-        self.parser.buffer_external_input(input);
+        self.parser.advance_input(input);
         events.extend(
             self.parser
                 .by_ref()
@@ -284,7 +281,9 @@ impl Parser {
         }
     }
 
-    fn buffer_external_input(&mut self, buffer: &[u8]) {
+    // A read boundary does not distinguish Escape from the start of a control sequence.
+    // Give both live and replayed input the same bounded continuation window.
+    fn advance_input(&mut self, buffer: &[u8]) {
         self.advance(buffer, true);
         if self.buffer.as_slice() == b"\x1b" {
             self.pending_escape_deadline = Some(Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
@@ -455,9 +454,51 @@ mod tests {
     }
 
     #[test]
+    fn live_color_report_can_split_after_escape() {
+        use crate::event::OscColorPayload;
+
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"\x1b").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(1))).unwrap(),
+            None
+        );
+        writer.write_all(b"]11;rgb:11/22/33\x07z").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb {
+                    r: 17,
+                    g: 34,
+                    b: 51
+                },
+            })
+        );
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('z').into())))
+        );
+    }
+
+    #[test]
+    fn standalone_live_escape_has_a_bounded_wait() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"\x1b").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(100))).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+        );
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::Complete
+        );
+    }
+
+    #[test]
     fn externally_buffered_escape_remains_available_for_its_continuation() {
         let mut parser = Parser::default();
-        parser.buffer_external_input(b"\x1b");
+        parser.advance_input(b"\x1b");
         assert_eq!(parser.next(), None);
 
         parser.advance(b"[A", false);
@@ -470,7 +511,7 @@ mod tests {
     #[test]
     fn standalone_buffered_escape_is_emitted_after_its_ambiguity_window() {
         let mut parser = Parser::default();
-        parser.buffer_external_input(b"\x1b");
+        parser.advance_input(b"\x1b");
         assert_eq!(parser.finish_pending_escape(), None);
 
         parser.pending_escape_deadline = Some(Instant::now());
@@ -484,7 +525,7 @@ mod tests {
     fn discarded_escape_suppresses_a_delayed_modifier_suffix() {
         for suffix in [b'y', b'1'] {
             let mut parser = Parser::default();
-            parser.buffer_external_input(b"\x1b");
+            parser.advance_input(b"\x1b");
             parser.pending_escape_deadline = Some(Instant::now());
 
             assert_eq!(
@@ -806,7 +847,7 @@ mod tests {
     #[test]
     fn expired_buffered_escape_reads_already_available_continuation_first() {
         let (mut source, mut writer) = source_with_input();
-        source.parser.buffer_external_input(b"\x1b");
+        source.parser.advance_input(b"\x1b");
         source.parser.pending_escape_deadline = Some(Instant::now());
         writer.write_all(b"[A").unwrap();
 
@@ -819,7 +860,7 @@ mod tests {
     #[test]
     fn expired_buffered_escape_remains_usable_without_a_continuation() {
         let (mut source, _writer) = source_with_input();
-        source.parser.buffer_external_input(b"\x1b");
+        source.parser.advance_input(b"\x1b");
         source.parser.pending_escape_deadline = Some(Instant::now());
 
         assert_eq!(
