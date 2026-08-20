@@ -39,17 +39,23 @@ fn extracts_color_reports_without_splitting_pasted_text() {
     assert_eq!(
         events.into_iter().collect::<Vec<_>>(),
         vec![
-            EventWithColor::ForegroundColor(Color::Rgb {
-                r: 238,
-                g: 238,
-                b: 238
-            }),
-            EventWithColor::BackgroundColor(Color::Rgb {
-                r: 17,
-                g: 34,
-                b: 51
-            }),
-            EventWithColor::Event(Event::Paste("α βγ".to_string())),
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb {
+                    r: 238,
+                    g: 238,
+                    b: 238
+                },
+            },
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb {
+                    r: 17,
+                    g: 34,
+                    b: 51
+                },
+            },
+            InternalEvent::Event(Event::Paste("α βγ".to_string())),
         ]
     );
 }
@@ -67,7 +73,7 @@ fn preserves_unrelated_malformed_and_incomplete_paste_sequences() {
         extract_paste_colors(text.clone(), &mut events);
         assert_eq!(
             events.into_iter().collect::<Vec<_>>(),
-            vec![EventWithColor::Event(Event::Paste(text))]
+            vec![InternalEvent::Event(Event::Paste(text))]
         );
     }
 }

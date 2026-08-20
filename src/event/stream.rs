@@ -15,13 +15,13 @@ use futures_core::stream::Stream;
 
 use crate::event::{
     filter::{EventFilter, Filter},
-    lock_internal_event_reader, poll_internal, read_internal,
+    lock_internal_event_reader, poll_internal,
     sys::Waker,
     Event, InternalEvent,
 };
 
 #[path = "stream_color.rs"]
-mod color;
+pub(super) mod color;
 pub use color::{ColorEventStream, EventWithColor};
 
 #[derive(Debug, Clone, Copy)]
@@ -162,7 +162,14 @@ impl EventStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<io::Result<InternalEvent>>> {
         let result = match poll_internal(Some(Duration::from_secs(0)), &self.filter) {
-            Ok(true) => Poll::Ready(Some(read_internal(&self.filter))),
+            Ok(true) => {
+                let mut reader = lock_internal_event_reader();
+                #[cfg(all(unix, feature = "bracketed-paste"))]
+                if matches!(self.filter, StreamFilter::InputAndColors) {
+                    return Poll::Ready(Some(reader.read_with_color_reports(&self.filter)));
+                }
+                Poll::Ready(Some(reader.read(&self.filter)))
+            }
             Ok(false) => {
                 if !self
                     .stream_wake_task_executed

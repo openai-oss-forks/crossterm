@@ -1,9 +1,11 @@
 use std::{
-    collections::VecDeque,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
+
+#[cfg(all(unix, feature = "bracketed-paste"))]
+use std::collections::VecDeque;
 
 use futures_core::stream::Stream;
 
@@ -37,15 +39,11 @@ impl From<Event> for EventWithColor {
 #[derive(Debug)]
 pub struct ColorEventStream {
     inner: EventStream,
-    pending: VecDeque<EventWithColor>,
 }
 
 impl ColorEventStream {
     pub(super) fn new(inner: EventStream) -> Self {
-        Self {
-            inner,
-            pending: VecDeque::new(),
-        }
+        Self { inner }
     }
 }
 
@@ -54,16 +52,8 @@ impl Stream for ColorEventStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let Some(event) = this.pending.pop_front() {
-            return Poll::Ready(Some(Ok(event)));
-        }
         match this.inner.poll_internal_event(cx) {
             Poll::Ready(Some(Ok(InternalEvent::Event(event)))) => {
-                #[cfg(all(unix, feature = "bracketed-paste"))]
-                if let Event::Paste(text) = event {
-                    extract_paste_colors(text, &mut this.pending);
-                    return Poll::Ready(this.pending.pop_front().map(Ok));
-                }
                 Poll::Ready(Some(Ok(EventWithColor::Event(event))))
             }
             #[cfg(unix)]
@@ -99,7 +89,7 @@ pub(super) fn color_report(event: &InternalEvent) -> Option<EventWithColor> {
 }
 
 #[cfg(all(unix, feature = "bracketed-paste"))]
-fn extract_paste_colors(text: String, pending: &mut VecDeque<EventWithColor>) {
+pub(in crate::event) fn extract_paste_colors(text: String, pending: &mut VecDeque<InternalEvent>) {
     const MAX_COLOR_REPORT_BYTES: usize = 1024;
     let bytes = text.as_bytes();
     let mut retained = String::new();
@@ -120,9 +110,9 @@ fn extract_paste_colors(text: String, pending: &mut VecDeque<EventWithColor>) {
             if let Ok(Some(event)) =
                 crate::event::sys::unix::parse::parse_event(&bytes[cursor..end], false)
             {
-                if let Some(color) = color_report(&event) {
+                if color_report(&event).is_some() {
                     retained.push_str(&text[copied..cursor]);
-                    pending.push_back(color);
+                    pending.push_back(event);
                     copied = end;
                     cursor = end;
                     continue;
@@ -132,10 +122,10 @@ fn extract_paste_colors(text: String, pending: &mut VecDeque<EventWithColor>) {
         cursor += 2;
     }
     if copied == 0 {
-        pending.push_back(EventWithColor::Event(Event::Paste(text)));
+        pending.push_back(InternalEvent::Event(Event::Paste(text)));
     } else {
         retained.push_str(&text[copied..]);
-        pending.push_back(EventWithColor::Event(Event::Paste(retained)));
+        pending.push_back(InternalEvent::Event(Event::Paste(retained)));
     }
 }
 

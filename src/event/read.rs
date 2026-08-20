@@ -145,6 +145,29 @@ impl InternalEventReader {
             let _ = self.poll(None, filter)?;
         }
     }
+
+    /// Keep input extracted from a paste in the shared queue so replacing a stream cannot
+    /// discard the remainder of an event that has already been read from the terminal.
+    #[cfg(all(unix, feature = "event-stream", feature = "bracketed-paste"))]
+    pub(crate) fn read_with_color_reports<F>(&mut self, filter: &F) -> io::Result<InternalEvent>
+    where
+        F: Filter,
+    {
+        let event = self.read(filter)?;
+        if let InternalEvent::Event(crate::event::Event::Paste(text)) = event {
+            let mut extracted = VecDeque::new();
+            crate::event::stream::color::extract_paste_colors(text, &mut extracted);
+            let first = extracted
+                .pop_front()
+                .expect("paste extraction retains a paste");
+            while let Some(event) = extracted.pop_back() {
+                self.events.push_front(event);
+            }
+            Ok(first)
+        } else {
+            Ok(event)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +273,44 @@ mod tests {
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), SKIPPED_EVENT);
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "event-stream", feature = "bracketed-paste"))]
+    fn color_stream_leaves_extracted_paste_in_shared_reader() {
+        use crate::event::{filter::EventFilter, KeyCode, OscColorPayload};
+
+        let key = InternalEvent::Event(Event::Key(KeyCode::Char('z').into()));
+        let mut reader = InternalEventReader {
+            events: VecDeque::from([
+                InternalEvent::Event(Event::Paste(
+                    "hello \x1b]11;rgb:11/22/33\x07world".to_string(),
+                )),
+                key.clone(),
+            ]),
+            source: None,
+            skipped_events: Vec::new(),
+        };
+
+        assert_eq!(
+            reader
+                .read_with_color_reports(&InternalEventFilter)
+                .unwrap(),
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb {
+                    r: 17,
+                    g: 34,
+                    b: 51
+                },
+            }
+        );
+        // A replacement reader, including an ordinary EventStream, must still see the paste.
+        assert_eq!(
+            reader.read(&EventFilter).unwrap(),
+            InternalEvent::Event(Event::Paste("hello world".to_string()))
+        );
+        assert_eq!(reader.read(&EventFilter).unwrap(), key);
     }
 
     #[test]
