@@ -1,8 +1,9 @@
 use std::io;
 
 use crate::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags,
-    MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
+    ColorScheme, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    KeyboardEnhancementFlags, MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 
 use crate::event::{InternalEvent, OscColorPayload};
@@ -231,6 +232,11 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         b'?' => match buffer[buffer.len() - 1] {
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
+            b'n' => {
+                return Ok(parse_csi_color_scheme(buffer)
+                    .map(Event::ColorScheme)
+                    .map(InternalEvent::Event));
+            }
             _ => None,
         },
         b'0'..=b'9' => {
@@ -262,6 +268,14 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     };
 
     Ok(input_event.map(InternalEvent::Event))
+}
+
+fn parse_csi_color_scheme(buffer: &[u8]) -> Option<ColorScheme> {
+    match buffer {
+        b"\x1B[?997;1n" => Some(ColorScheme::Dark),
+        b"\x1B[?997;2n" => Some(ColorScheme::Light),
+        _ => None,
+    }
 }
 
 pub(crate) fn next_parsed<T>(iter: &mut dyn Iterator<Item = &str>) -> io::Result<T>
@@ -1128,6 +1142,28 @@ mod tests {
             parse_csi(b"\x1B[O").unwrap(),
             Some(InternalEvent::Event(Event::FocusLost))
         );
+    }
+
+    #[test]
+    fn test_parse_csi_color_scheme() {
+        assert_eq!(
+            parse_csi(b"\x1B[?997;1n").unwrap(),
+            Some(InternalEvent::Event(Event::ColorScheme(ColorScheme::Dark)))
+        );
+        assert_eq!(
+            parse_csi(b"\x1B[?997;2n").unwrap(),
+            Some(InternalEvent::Event(Event::ColorScheme(ColorScheme::Light)))
+        );
+
+        for malformed in [
+            b"\x1B[?997n".as_slice(),
+            b"\x1B[?997;0n",
+            b"\x1B[?997;3n",
+            b"\x1B[?997;1;2n",
+            b"\x1B[?996;1n",
+        ] {
+            assert_eq!(parse_csi(malformed).unwrap(), None);
+        }
     }
 
     #[test]
