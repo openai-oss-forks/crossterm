@@ -1,5 +1,6 @@
-use super::Parser;
 use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, KeyEvent, KeyModifiers};
+
+use super::Parser;
 
 fn key(code: KeyCode, modifiers: KeyModifiers) -> InternalEvent {
     InternalEvent::Event(Event::Key(KeyEvent::new(code, modifiers)))
