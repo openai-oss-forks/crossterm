@@ -26,6 +26,8 @@ const WAKE_TOKEN: Token = Token(2);
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
 const BUFFERED_ESCAPE_TIMEOUT: Duration = Duration::from_millis(20);
+// Match the color-query response budget rather than the much shorter lone-ESC window.
+const OSC_TIMEOUT: Duration = Duration::from_secs(2);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -99,7 +101,7 @@ impl EventSource for UnixInternalEventSource {
 
                 if self.events.is_empty() {
                     // No readiness events = timeout
-                    return Ok(self.parser.finish_pending_escape());
+                    return Ok(self.parser.finish_pending_input());
                 }
             }
 
@@ -140,7 +142,7 @@ impl EventSource for UnixInternalEventSource {
                             }
                             if timeout.elapsed() {
                                 self.pending_tty_readable = true;
-                                return Ok(self.parser.finish_pending_escape());
+                                return Ok(self.parser.finish_pending_input());
                             }
                         }
                     }
@@ -172,7 +174,7 @@ impl EventSource for UnixInternalEventSource {
 
             // Processing above can take some time, check if timeout expired
             if timeout.elapsed() {
-                return Ok(self.parser.finish_pending_escape());
+                return Ok(self.parser.finish_pending_input());
             }
         }
     }
@@ -207,6 +209,7 @@ struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
     pending_escape_deadline: Option<Instant>,
+    pending_osc_deadline: Option<Instant>,
     discarded_sequence: Option<DiscardedSequence>,
 }
 
@@ -242,6 +245,7 @@ impl Default for Parser {
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
             pending_escape_deadline: None,
+            pending_osc_deadline: None,
             discarded_sequence: None,
         }
     }
@@ -292,7 +296,12 @@ impl Parser {
     }
 
     fn poll_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
-        let Some(deadline) = self.pending_escape_deadline else {
+        let Some(deadline) = self
+            .pending_escape_deadline
+            .into_iter()
+            .chain(self.pending_osc_deadline)
+            .min()
+        else {
             return timeout;
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -310,9 +319,72 @@ impl Parser {
         Some(event)
     }
 
+    fn update_pending_osc(&mut self) {
+        if self.buffer.starts_with(b"\x1b]")
+            || matches!(
+                self.discarded_sequence,
+                Some(DiscardedSequence::OscBody | DiscardedSequence::OscEscape)
+            )
+        {
+            self.pending_osc_deadline
+                .get_or_insert_with(|| Instant::now() + OSC_TIMEOUT);
+        } else {
+            self.pending_osc_deadline = None;
+        }
+    }
+
+    fn finish_pending_osc(&mut self) -> Option<InternalEvent> {
+        if Instant::now() < self.pending_osc_deadline? {
+            return None;
+        }
+        self.pending_osc_deadline = None;
+        let event = if self.buffer == b"\x1b]" {
+            Some(InternalEvent::Event(Event::Key(
+                crate::event::KeyEvent::new(
+                    crate::event::KeyCode::Char(']'),
+                    crate::event::KeyModifiers::ALT,
+                ),
+            )))
+        } else if self.buffer.ends_with(b"\x1b") {
+            Some(InternalEvent::Event(Event::Key(
+                crate::event::KeyCode::Esc.into(),
+            )))
+        } else {
+            None
+        };
+        self.buffer.clear();
+        self.discarded_sequence = None;
+        event
+    }
+
+    fn finish_pending_input(&mut self) -> Option<InternalEvent> {
+        self.finish_pending_osc()
+            .or_else(|| self.finish_pending_escape())
+    }
+
     fn advance(&mut self, buffer: &[u8], more: bool) {
+        if let Some(event) = self.finish_pending_osc() {
+            self.internal_events.push_back(event);
+        }
         self.pending_escape_deadline = None;
         for (idx, byte) in buffer.iter().enumerate() {
+            if self.pending_osc_deadline.is_some() {
+                // Interrupt/EOF keys must not be discarded with an unfinished reply, even
+                // when they arrive in the same read as the OSC prefix.
+                let interrupt = matches!(*byte, b'\x03' | b'\x04');
+                let restart = (self.buffer.ends_with(b"\x1b")
+                    || matches!(self.discarded_sequence, Some(DiscardedSequence::OscEscape)))
+                    && !matches!(*byte, b'\\' | b'\x07');
+                if interrupt || restart {
+                    self.buffer.clear();
+                    self.discarded_sequence = None;
+                    self.pending_osc_deadline = None;
+                    if restart && !interrupt {
+                        // ESC not followed by ST starts a new escape/key sequence.
+                        self.buffer.push(b'\x1b');
+                    }
+                }
+            }
             if let Some(discarded_sequence) = self.discarded_sequence {
                 self.discarded_sequence = match discarded_sequence {
                     DiscardedSequence::PasteStart(matched)
@@ -387,6 +459,7 @@ impl Parser {
                     DiscardedSequence::X10Mouse(_) => None,
                     DiscardedSequence::Ss3 => Some(DiscardedSequence::Ss3),
                 };
+                self.update_pending_osc();
                 continue;
             }
             let more = idx + 1 < buffer.len() || more;
@@ -420,6 +493,7 @@ impl Parser {
                     self.buffer.clear();
                 }
             }
+            self.update_pending_osc();
         }
     }
 }
@@ -439,7 +513,7 @@ mod tests {
     use crate::terminal::sys::file_descriptor::FileDesc;
     use std::{io::Write, os::unix::net::UnixStream};
 
-    fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
+    pub(super) fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
         let (reader, writer) = UnixStream::pair().unwrap();
         #[cfg(feature = "libc")]
         let reader = {
@@ -918,3 +992,7 @@ mod tests {
         producer.join().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "osc_tests.rs"]
+mod osc_tests;
