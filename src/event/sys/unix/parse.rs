@@ -1,7 +1,7 @@
 use std::io;
 
 use crate::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags,
+    ColorScheme, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags,
     MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
 
@@ -231,6 +231,7 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         b'?' => match buffer[buffer.len() - 1] {
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
+            b'n' => return parse_csi_color_scheme_report(buffer),
             _ => None,
         },
         b'0'..=b'9' => {
@@ -349,6 +350,34 @@ fn parse_csi_primary_device_attributes(buffer: &[u8]) -> io::Result<Option<Inter
     // See <https://vt100.net/docs/vt510-rm/DA1.html>
 
     Ok(Some(InternalEvent::PrimaryDeviceAttributes))
+}
+
+fn parse_csi_color_scheme_report(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    // ESC [ ? 997 ; scheme n
+    //
+    // Sent by terminals that implement DEC private mode 2031 (color scheme change
+    // notifications, see <https://contour-terminal.org/vt-extensions/color-palette-update-notifications/>)
+    // whenever the terminal switches between dark and light, and as the reply to
+    // `CSI ? 996 n`. Any other `CSI ? ... n` report is unknown to us and is discarded.
+    assert!(buffer.starts_with(b"\x1B[?"));
+    assert!(buffer.ends_with(b"n"));
+
+    let s = std::str::from_utf8(&buffer[3..buffer.len() - 1])
+        .map_err(|_| could_not_parse_event_error())?;
+    let mut split = s.split(';');
+    if split.next() != Some("997") {
+        return Err(could_not_parse_event_error());
+    }
+    let scheme = match split.next() {
+        Some("1") => ColorScheme::Dark,
+        Some("2") => ColorScheme::Light,
+        _ => return Err(could_not_parse_event_error()),
+    };
+    if split.next().is_some() {
+        return Err(could_not_parse_event_error());
+    }
+
+    Ok(Some(InternalEvent::Event(Event::ColorSchemeChanged(scheme))))
 }
 
 fn parse_modifiers(mask: u8) -> KeyModifiers {
@@ -1128,6 +1157,27 @@ mod tests {
             parse_csi(b"\x1B[O").unwrap(),
             Some(InternalEvent::Event(Event::FocusLost))
         );
+    }
+
+    #[test]
+    fn test_parse_csi_color_scheme_report() {
+        assert_eq!(
+            parse_csi(b"\x1B[?997;1n").unwrap(),
+            Some(InternalEvent::Event(Event::ColorSchemeChanged(
+                ColorScheme::Dark
+            )))
+        );
+        assert_eq!(
+            parse_csi(b"\x1B[?997;2n").unwrap(),
+            Some(InternalEvent::Event(Event::ColorSchemeChanged(
+                ColorScheme::Light
+            )))
+        );
+        // Incomplete: keep buffering.
+        assert_eq!(parse_csi(b"\x1B[?997;").unwrap(), None);
+        // Unknown scheme value or a different DSR report: reject so the buffer is cleared.
+        assert!(parse_csi(b"\x1B[?997;3n").is_err());
+        assert!(parse_csi(b"\x1B[?998;1n").is_err());
     }
 
     #[test]
