@@ -228,6 +228,9 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         b'P' => Some(Event::Key(KeyCode::F(1).into())),
         b'Q' => Some(Event::Key(KeyCode::F(2).into())),
         b'S' => Some(Event::Key(KeyCode::F(4).into())),
+        // Keep secondary device attributes framed until their final byte. The input
+        // parser consumes completed, unhandled CSI replies without producing keys.
+        b'>' => None,
         b'?' => match buffer[buffer.len() - 1] {
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
