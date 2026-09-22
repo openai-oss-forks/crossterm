@@ -58,6 +58,16 @@
 //! println!("{}", "Red foreground color & blue background.".red().on_blue());
 //! ```
 //!
+//! ### Color Queries
+//!
+//! When the `events` feature is enabled on Unix-like platforms, the helper functions
+//! [`query_foreground_color`](crate::style::query_foreground_color) and
+//! [`query_background_color`](crate::style::query_background_color) can be used to ask the terminal for
+//! its active default colors. Each function returns `io::Result<Option<Color>>`, yielding
+//! `Some(Color::Rgb { .. })` when the terminal responds with an OSC 10/11 RGB value, `Ok(None)` if
+//! the payload is not recognized, or an error if the terminal does not respond within two seconds.
+//! On other platforms the functions return [`std::io::ErrorKind::Unsupported`].
+//!
 //! ### Attributes
 //!
 //! How to apply terminal attributes to text.
@@ -131,10 +141,14 @@ pub use self::{
 mod attributes;
 mod content_style;
 mod hyperlink;
+#[cfg(feature = "events")]
+mod query;
 mod styled_content;
 mod stylize;
 mod sys;
 mod types;
+#[cfg(feature = "events")]
+pub use query::{query_background_color, query_foreground_color};
 
 /// Creates a `StyledContent`.
 ///
