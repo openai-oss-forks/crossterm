@@ -1,6 +1,8 @@
 use std::{collections::vec_deque::VecDeque, io, time::Duration};
 
 #[cfg(unix)]
+use crate::event::InputDiscardStatus;
+#[cfg(unix)]
 use crate::event::source::unix::UnixInternalEventSource;
 #[cfg(windows)]
 use crate::event::source::windows::WindowsEventSource;
@@ -35,6 +37,28 @@ impl Default for InternalEventReader {
 }
 
 impl InternalEventReader {
+    #[cfg(unix)]
+    pub(crate) fn buffer_input(&mut self, input: &[u8]) -> io::Result<()> {
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
+        source.buffer_input(input, &mut self.events);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn discard_buffered_input(&mut self) -> io::Result<InputDiscardStatus> {
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
+        let status = source.discard_buffered_input();
+        self.events.clear();
+        self.skipped_events.clear();
+        Ok(status)
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
@@ -272,6 +296,60 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_buffer_input_preserves_events_around_terminal_responses() {
+        let input = [
+            InternalEvent::Event(Event::Resize(10, 10)),
+            InternalEvent::CursorPosition(4, 8),
+            InternalEvent::Event(Event::Resize(20, 20)),
+        ];
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(FakeSource::with_events(&input))),
+            skipped_events: Vec::with_capacity(32),
+        };
+
+        reader.buffer_input(b"raw terminal input").unwrap();
+
+        assert_eq!(
+            reader.events,
+            VecDeque::from([
+                InternalEvent::Event(Event::Resize(10, 10)),
+                InternalEvent::Event(Event::Resize(20, 20)),
+            ])
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_discard_buffered_input_clears_all_event_queues() {
+        let mut reader = InternalEventReader {
+            events: VecDeque::from([InternalEvent::Event(Event::Resize(10, 10))]),
+            source: Some(Box::new(FakeSource::with_events(&[InternalEvent::Event(
+                Event::Resize(20, 20),
+            )]))),
+            skipped_events: vec![InternalEvent::CursorPosition(4, 8)],
+        };
+
+        assert_eq!(
+            reader.discard_buffered_input().unwrap(),
+            super::InputDiscardStatus::Complete
+        );
+
+        assert!(reader.events.is_empty());
+        assert!(reader.skipped_events.is_empty());
+        assert_eq!(
+            reader
+                .source
+                .as_mut()
+                .unwrap()
+                .try_read(Some(Duration::from_secs(0)))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn test_poll_timeouts_if_source_has_no_events() {
         let source = FakeSource::default();
 
@@ -475,6 +553,21 @@ mod tests {
 
             // Timeout
             Ok(None)
+        }
+
+        #[cfg(unix)]
+        fn buffer_input(&mut self, _input: &[u8], events: &mut VecDeque<InternalEvent>) {
+            events.extend(
+                self.events
+                    .drain(..)
+                    .filter(|event| matches!(event, InternalEvent::Event(_))),
+            );
+        }
+
+        #[cfg(unix)]
+        fn discard_buffered_input(&mut self) -> super::InputDiscardStatus {
+            self.events.clear();
+            super::InputDiscardStatus::Complete
         }
 
         #[cfg(feature = "event-stream")]

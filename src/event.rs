@@ -234,6 +234,51 @@ pub fn read() -> std::io::Result<Event> {
     }
 }
 
+/// Parse terminal input already read by another terminal consumer and retain its events.
+///
+/// This allows a terminal query to inspect raw responses without discarding interleaved keyboard,
+/// paste, or focus events. Query responses are omitted because the caller already consumed them,
+/// and incomplete sequences remain buffered for the next terminal read.
+///
+/// Drop or pause all active `EventStream`s and other blocking event-reader users before calling this
+/// function. Event readers share a global lock, so a concurrently blocked reader can prevent it from
+/// returning.
+#[cfg(unix)]
+pub fn buffer_input(input: &[u8]) -> std::io::Result<()> {
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    internal::lock_event_reader().buffer_input(input)
+}
+
+/// Whether discarding buffered input encountered an incomplete control sequence.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputDiscardStatus {
+    /// Buffered events and incomplete input sequences were fully discarded.
+    Complete,
+    /// A bracketed paste started before the discard and has not finished yet.
+    BracketedPasteInProgress,
+    /// An escape control sequence started before the discard and has not finished yet.
+    ControlSequenceInProgress,
+}
+
+/// Discard decoded events while preserving incomplete escape-sequence boundaries.
+///
+/// This does not flush the operating system's terminal input queue. Callers that need a clean
+/// input boundary should drain it through the event reader. If an incomplete bracketed paste or
+/// other control sequence is reported, its remaining bytes are discarded without producing events
+/// until its closing marker arrives. Call this function again to determine whether it has finished.
+///
+/// Drop or pause all active `EventStream`s and other blocking event-reader users before calling this
+/// function. Event readers share a global lock, so a concurrently blocked reader can prevent it from
+/// returning.
+#[cfg(unix)]
+pub fn discard_buffered_input() -> std::io::Result<InputDiscardStatus> {
+    internal::lock_event_reader().discard_buffered_input()
+}
+
 /// Attempts to read a single [`Event`](enum.Event.html) without blocking the thread.
 ///
 /// If no event is found, `None` is returned.
