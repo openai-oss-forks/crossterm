@@ -120,6 +120,14 @@ impl InternalEventReader {
     where
         F: Filter,
     {
+        self.read_queued(filter).map(unwrap_processed_paste)
+    }
+
+    /// Read a matching event without erasing the marker on an already-scanned paste.
+    fn read_queued<F>(&mut self, filter: &F) -> io::Result<InternalEvent>
+    where
+        F: Filter,
+    {
         let mut skipped_events = VecDeque::new();
 
         loop {
@@ -144,6 +152,43 @@ impl InternalEventReader {
 
             let _ = self.poll(None, filter)?;
         }
+    }
+
+    /// Extract color reports once, before delivering the retained text as one paste.
+    ///
+    /// Keep the remaining events in the shared queue so replacing a stream cannot lose input.
+    /// Preserve processed-paste markers until delivery to avoid interpreting text exposed by
+    /// an earlier extraction as another terminal reply.
+    #[cfg(all(unix, feature = "event-stream", feature = "bracketed-paste"))]
+    pub(crate) fn read_with_color_reports<F>(&mut self, filter: &F) -> io::Result<InternalEvent>
+    where
+        F: Filter,
+    {
+        let event = self.read_queued(filter)?;
+        let event = if let InternalEvent::Event(crate::event::Event::Paste(text)) = event {
+            let mut extracted = crate::event::stream::color::extract_paste_colors(text);
+            let first = extracted
+                .pop_front()
+                .expect("paste extraction retains a paste");
+            while let Some(event) = extracted.pop_back() {
+                self.events.push_front(event);
+            }
+            first
+        } else {
+            event
+        };
+        Ok(unwrap_processed_paste(event))
+    }
+}
+
+/// Keep the processed-paste marker private to the shared queue.
+fn unwrap_processed_paste(event: InternalEvent) -> InternalEvent {
+    match event {
+        #[cfg(all(unix, feature = "event-stream", feature = "bracketed-paste"))]
+        InternalEvent::ProcessedPaste(text) => {
+            InternalEvent::Event(crate::event::Event::Paste(text))
+        }
+        event => event,
     }
 }
 
@@ -250,6 +295,92 @@ mod tests {
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), SKIPPED_EVENT);
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "event-stream", feature = "bracketed-paste"))]
+    fn color_stream_leaves_extracted_paste_in_shared_reader() {
+        use crate::event::{filter::EventFilter, KeyCode, OscColorPayload};
+
+        let key = InternalEvent::Event(Event::Key(KeyCode::Char('z').into()));
+        let mut reader = InternalEventReader {
+            events: VecDeque::from([
+                InternalEvent::Event(Event::Paste(
+                    "hello \x1b]11;rgb:11/22/33\x07world".to_string(),
+                )),
+                key.clone(),
+            ]),
+            source: None,
+            skipped_events: Vec::new(),
+        };
+
+        assert_eq!(
+            reader
+                .read_with_color_reports(&InternalEventFilter)
+                .unwrap(),
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb {
+                    r: 17,
+                    g: 34,
+                    b: 51
+                },
+            }
+        );
+        // A replacement reader, including an ordinary EventStream, must still see the paste.
+        assert_eq!(
+            reader.read(&EventFilter).unwrap(),
+            InternalEvent::Event(Event::Paste("hello world".to_string()))
+        );
+        assert_eq!(reader.read(&EventFilter).unwrap(), key);
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "event-stream", feature = "bracketed-paste"))]
+    fn color_stream_does_not_rescan_the_retained_paste() {
+        use crate::event::{filter::EventFilter, KeyCode, OscColorPayload};
+
+        for (input, retained) in [
+            (
+                "before\x1b]11;rgb:11/22/\x1b]10;rgb:aa/bb/cc\x0733\x07after",
+                "before\x1b]11;rgb:11/22/33\x07after",
+            ),
+            (
+                "\x1b\x1b]10;rgb:aa/bb/cc\x07]11;rgb:44/55/66\x07plain",
+                "\x1b]11;rgb:44/55/66\x07plain",
+            ),
+        ] {
+            let key = InternalEvent::Event(Event::Key(KeyCode::Char('z').into()));
+            let mut reader = InternalEventReader {
+                events: VecDeque::from([
+                    InternalEvent::Event(Event::Paste(input.to_string())),
+                    key.clone(),
+                ]),
+                source: None,
+                skipped_events: Vec::new(),
+            };
+            assert_eq!(
+                reader
+                    .read_with_color_reports(&InternalEventFilter)
+                    .unwrap(),
+                InternalEvent::OscColor {
+                    slot: 10,
+                    payload: OscColorPayload::Rgb {
+                        r: 170,
+                        g: 187,
+                        b: 204
+                    },
+                }
+            );
+            assert!(reader.poll(Some(Duration::ZERO), &EventFilter).unwrap());
+            assert_eq!(
+                reader
+                    .read_with_color_reports(&InternalEventFilter)
+                    .unwrap(),
+                InternalEvent::Event(Event::Paste(retained.to_string()))
+            );
+            assert_eq!(reader.read(&EventFilter).unwrap(), key);
+        }
     }
 
     #[test]
