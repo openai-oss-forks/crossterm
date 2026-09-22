@@ -587,6 +587,16 @@ impl Command for PopKeyboardEnhancementFlags {
     }
 }
 
+/// Terminal-reported dark or light color-scheme preference.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum ColorScheme {
+    /// Terminal prefers colors suitable for a dark background.
+    Dark,
+    /// Terminal prefers colors suitable for a light background.
+    Light,
+}
+
 /// Represents an event.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "derive-more", derive(IsVariant))]
@@ -597,6 +607,8 @@ pub enum Event {
     FocusGained,
     /// The terminal lost focus
     FocusLost,
+    /// The terminal's preferred color scheme changed.
+    ColorScheme(ColorScheme),
     /// A single key event with additional pressed modifiers.
     Key(KeyEvent),
     /// A single mouse event with additional pressed modifiers.
