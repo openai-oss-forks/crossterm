@@ -479,6 +479,10 @@ impl Iterator for Parser {
 }
 
 #[cfg(test)]
+#[path = "../secondary_device_attributes_tests.rs"]
+mod secondary_device_attributes_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Parser, UnixInternalEventSource};
     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
