@@ -16,6 +16,10 @@ use crate::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
+#[cfg(test)]
+#[path = "parse_tests.rs"]
+mod tests;
+
 #[derive(Default)]
 pub struct MouseButtonsPressed {
     pub(crate) left: bool,
@@ -235,6 +239,8 @@ fn parse_key_event_record(key_event: &KeyEventRecord) -> Option<WindowsKeyEvent>
         VK_SHIFT | VK_CONTROL | VK_MENU => None,
         VK_BACK => Some(KeyCode::Backspace),
         VK_ESCAPE => Some(KeyCode::Esc),
+        // ConPTY can deliver escape-sequence characters without a virtual key code.
+        0 if key_event.u_char == 0x1b => Some(KeyCode::Esc),
         VK_RETURN => Some(KeyCode::Enter),
         VK_F1..=VK_F24 => Some(KeyCode::F((key_event.virtual_key_code - 111) as u8)),
         VK_LEFT => Some(KeyCode::Left),
