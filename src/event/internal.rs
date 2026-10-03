@@ -86,6 +86,17 @@ pub(crate) enum InternalEvent {
     ColorSchemeChanged,
 }
 
+impl InternalEvent {
+    /// Keep palette generations framed when an application quarantines user input.
+    #[cfg(unix)]
+    pub(crate) fn is_palette_response(&self) -> bool {
+        matches!(
+            self,
+            Self::OscColor { .. } | Self::OperatingStatus | Self::ColorSchemeChanged
+        )
+    }
+}
+
 /// Parsed payload of an OSC color response.
 #[derive(Debug, PartialOrd, PartialEq, Hash, Clone, Eq)]
 pub(crate) enum OscColorPayload {

@@ -54,8 +54,9 @@ impl InternalEventReader {
             .as_mut()
             .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
         let status = source.discard_buffered_input();
-        self.events.clear();
-        self.skipped_events.clear();
+        self.events.retain(InternalEvent::is_palette_response);
+        self.skipped_events
+            .retain(InternalEvent::is_palette_response);
         Ok(status)
     }
 
@@ -322,13 +323,19 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_discard_buffered_input_clears_all_event_queues() {
+    fn test_discard_buffered_input_clears_input_and_retains_palette_boundaries() {
         let mut reader = InternalEventReader {
-            events: VecDeque::from([InternalEvent::Event(Event::Resize(10, 10))]),
+            events: VecDeque::from([
+                InternalEvent::Event(Event::Resize(10, 10)),
+                InternalEvent::OperatingStatus,
+            ]),
             source: Some(Box::new(FakeSource::with_events(&[InternalEvent::Event(
                 Event::Resize(20, 20),
             )]))),
-            skipped_events: vec![InternalEvent::CursorPosition(4, 8)],
+            skipped_events: vec![
+                InternalEvent::CursorPosition(4, 8),
+                InternalEvent::ColorSchemeChanged,
+            ],
         };
 
         assert_eq!(
@@ -336,8 +343,8 @@ mod tests {
             super::InputDiscardStatus::Complete
         );
 
-        assert!(reader.events.is_empty());
-        assert!(reader.skipped_events.is_empty());
+        assert_eq!(reader.events, [InternalEvent::OperatingStatus]);
+        assert_eq!(reader.skipped_events, [InternalEvent::ColorSchemeChanged]);
         assert_eq!(
             reader
                 .source
