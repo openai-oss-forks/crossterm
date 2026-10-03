@@ -46,3 +46,54 @@ fn preserves_escape_and_literal_characters_from_console_records() {
         }
     }
 }
+
+fn alt_code_record(u_char: u16) -> KeyEventRecord {
+    // INPUT_RECORD contains only integers and unions of integer records.
+    let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+    record.EventType = KEY_EVENT;
+    unsafe {
+        let key = record.Event.KeyEvent_mut();
+        key.bKeyDown = 0;
+        key.wRepeatCount = 1;
+        key.wVirtualKeyCode = VK_MENU as u16;
+        key.wVirtualScanCode = 56;
+        *key.uChar.UnicodeChar_mut() = u_char;
+        key.dwControlKeyState = 0;
+    }
+    let InputRecord::KeyEvent(key) = InputRecord::from(record) else {
+        panic!("expected a key input record");
+    };
+    key
+}
+
+#[test]
+fn completed_bmp_alt_code_is_a_press_event() {
+    let mut surrogate_buffer = None;
+    let event = handle_key_event(alt_code_record('♣' as u16), &mut surrogate_buffer);
+
+    assert_eq!(
+        event,
+        Some(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('♣'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )))
+    );
+}
+
+#[test]
+fn completed_surrogate_alt_code_is_a_press_event() {
+    let mut surrogate_buffer = None;
+    assert_eq!(
+        handle_key_event(alt_code_record(0xd83e), &mut surrogate_buffer),
+        None
+    );
+    assert_eq!(
+        handle_key_event(alt_code_record(0xddb8), &mut surrogate_buffer),
+        Some(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('🦸'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )))
+    );
+}
