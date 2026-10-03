@@ -133,7 +133,7 @@ use derive_more::derive::IsVariant;
 #[cfg(feature = "event-stream")]
 pub use stream::EventStream;
 #[cfg(feature = "event-stream")]
-pub use stream::{drain_terminal_responses, TerminalEvent, TerminalEventStream};
+pub use stream::{TerminalEvent, TerminalEventStream, drain_terminal_responses};
 
 use crate::{
     Command, csi,

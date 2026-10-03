@@ -207,7 +207,7 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
                     }
                     match last_byte {
                         b'n' if buffer == b"\x1b[0n" => {
-                            return Ok(Some(InternalEvent::OperatingStatus))
+                            return Ok(Some(InternalEvent::OperatingStatus));
                         }
                         b'M' => return parse_csi_rxvt_mouse(buffer),
                         b'~' => return parse_csi_special_key_code(buffer),
@@ -875,6 +875,7 @@ pub(crate) fn parse_utf8_char(buffer: &[u8]) -> io::Result<Option<char>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::event::internal::OscColorPayload;
     use crate::event::{KeyEventState, KeyModifiers, MouseButton, MouseEvent};
 
     use super::*;

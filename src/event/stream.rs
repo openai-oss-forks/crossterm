@@ -2,9 +2,9 @@ use std::{
     io,
     pin::Pin,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender},
-        Arc,
     },
     task::{Context, Poll},
     thread,
@@ -14,10 +14,10 @@ use std::{
 use futures_core::stream::Stream;
 
 use crate::event::{
+    Event,
     filter::{EventFilter, Filter},
     internal::{self, InternalEvent},
     sys::Waker,
-    Event,
 };
 
 /// A stream of `Result<Event>`.
@@ -125,7 +125,7 @@ impl Stream for EventStream {
 
 impl EventStream {
     fn poll_internal_event(&self, cx: &mut Context<'_>) -> Poll<Option<io::Result<InternalEvent>>> {
-        let result = match internal::poll(Some(Duration::from_secs(0)), &self.filter) {
+        match internal::poll(Some(Duration::from_secs(0)), &self.filter) {
             Ok(true) => Poll::Ready(Some(internal::read(&self.filter))),
             Ok(false) => {
                 if !self
@@ -150,8 +150,7 @@ impl EventStream {
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Some(Err(e))),
-        };
-        result
+        }
     }
 }
 
