@@ -26,7 +26,7 @@ use crate::event::{
 /// to make it available.**
 ///
 /// It implements the [Stream](futures_core::stream::Stream)
-/// trait and allows you to receive [`Event`]s with [`async-std`](https://crates.io/crates/async-std)
+/// trait and allows you to receive [`Event`]s with [`smol`](https://crates.io/crates/smol)
 /// or [`tokio`](https://crates.io/crates/tokio) crates.
 ///
 /// Check the [examples](https://github.com/crossterm-rs/crossterm/tree/master/examples) folder to see how to use
@@ -116,7 +116,6 @@ impl Stream for EventStream {
             event.map(|event| {
                 event.map(|event| match event {
                     InternalEvent::Event(event) => event,
-                    #[cfg(unix)]
                     _ => unreachable!(),
                 })
             })
@@ -160,20 +159,22 @@ impl EventStream {
 enum StreamFilter {
     Input,
     Terminal,
+    Responses,
 }
 
 impl Filter for StreamFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
-        #[cfg(unix)]
-        if matches!(self, Self::Terminal)
+        if matches!(self, Self::Terminal | Self::Responses)
             && matches!(
                 event,
-                InternalEvent::OscColor { .. } | InternalEvent::ColorSchemeChanged
+                InternalEvent::OscColor { .. }
+                    | InternalEvent::ColorSchemeChanged
+                    | InternalEvent::OperatingStatus
             )
         {
             return true;
         }
-        EventFilter.eval(event)
+        !matches!(self, Self::Responses) && EventFilter.eval(event)
     }
 }
 
@@ -189,6 +190,8 @@ pub enum TerminalEvent {
     },
     /// A DEC mode 2031 notification; query OSC 10/11 to obtain the new colors.
     ColorSchemeChanged,
+    /// Reply to a operating-status query, useful as a response-ordering barrier.
+    OperatingStatus,
 }
 
 /// An opt-in event stream that delivers OSC color replies and DEC mode 2031 notifications.
@@ -214,7 +217,6 @@ impl Stream for TerminalEventStream {
             event.map(|event| {
                 event.map(|event| match event {
                     InternalEvent::Event(event) => TerminalEvent::Input(event),
-                    #[cfg(unix)]
                     InternalEvent::OscColor { slot, payload } => TerminalEvent::Color {
                         slot,
                         color: match payload {
@@ -224,13 +226,39 @@ impl Stream for TerminalEventStream {
                             super::internal::OscColorPayload::Unrecognized(_) => None,
                         },
                     },
-                    #[cfg(unix)]
+                    InternalEvent::OperatingStatus => TerminalEvent::OperatingStatus,
                     InternalEvent::ColorSchemeChanged => TerminalEvent::ColorSchemeChanged,
                     #[cfg(unix)]
                     _ => unreachable!(),
                 })
             })
         })
+    }
+}
+
+/// Drain terminal responses through the next operating-status reply.
+///
+/// Drop the event stream before calling this function. Ordinary input stays in the shared
+/// reader's queue. A timeout does not establish that outstanding queries have completed.
+pub fn drain_terminal_responses(timeout: Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if !internal::poll(Some(remaining), &StreamFilter::Responses)? {
+            if std::time::Instant::now() < deadline {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "terminal query still pending",
+            ));
+        }
+        if matches!(
+            internal::read(&StreamFilter::Responses)?,
+            InternalEvent::OperatingStatus
+        ) {
+            return Ok(());
+        }
     }
 }
 

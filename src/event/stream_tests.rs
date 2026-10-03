@@ -1,5 +1,5 @@
 use super::*;
-use crate::event::{KeyCode, OscColorPayload};
+use crate::event::{KeyCode, internal::OscColorPayload};
 
 #[test]
 fn terminal_stream_includes_palette_replies_without_changing_input_streams() {
@@ -8,6 +8,7 @@ fn terminal_stream_includes_palette_replies_without_changing_input_streams() {
     assert!(StreamFilter::Terminal.eval(&key));
     for event in [
         InternalEvent::ColorSchemeChanged,
+        InternalEvent::OperatingStatus,
         InternalEvent::OscColor {
             slot: 10,
             payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
