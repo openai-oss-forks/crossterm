@@ -232,6 +232,9 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         // parser consumes completed, unhandled CSI replies without producing keys.
         b'>' => None,
         b'?' => match buffer[buffer.len() - 1] {
+            b'n' if matches!(buffer, b"\x1b[?997;1n" | b"\x1b[?997;2n") => {
+                return Ok(Some(InternalEvent::ColorSchemeChanged));
+            }
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
             _ => None,
@@ -1132,6 +1135,15 @@ mod tests {
             parse_csi(b"\x1B[O").unwrap(),
             Some(InternalEvent::Event(Event::FocusLost))
         );
+        for notification in [b"\x1b[?997;1n", b"\x1b[?997;2n"] {
+            for end in 2..notification.len() {
+                assert_eq!(parse_csi(&notification[..end]).unwrap(), None);
+            }
+            assert_eq!(
+                parse_csi(notification).unwrap(),
+                Some(InternalEvent::ColorSchemeChanged)
+            );
+        }
     }
 
     #[test]

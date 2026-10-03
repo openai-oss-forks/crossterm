@@ -81,6 +81,9 @@ pub(crate) enum InternalEvent {
     /// OSC color response (`slot`, `payload`).
     #[cfg(unix)]
     OscColor { slot: u8, payload: OscColorPayload },
+    /// A DEC mode 2031 palette-change notification.
+    #[cfg(unix)]
+    ColorSchemeChanged,
 }
 
 /// Parsed payload of an OSC color response.

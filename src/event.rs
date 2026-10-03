@@ -131,6 +131,8 @@ pub(crate) mod timeout;
 use derive_more::derive::IsVariant;
 #[cfg(feature = "event-stream")]
 pub use stream::EventStream;
+#[cfg(feature = "event-stream")]
+pub use stream::{TerminalEvent, TerminalEventStream};
 
 use crate::{
     Command, csi,
