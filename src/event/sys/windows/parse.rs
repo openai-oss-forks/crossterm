@@ -216,12 +216,12 @@ fn parse_key_event_record(key_event: &KeyEventRecord) -> Option<WindowsKeyEvent>
                 // values.
                 let ch = std::char::from_u32(unicode_scalar_value as u32).unwrap();
                 let key_code = KeyCode::Char(ch);
-                let kind = if key_event.key_down {
-                    KeyEventKind::Press
-                } else {
-                    KeyEventKind::Release
-                };
-                let key_event = KeyEvent::new_with_kind(key_code, modifiers, kind);
+                // Windows reports a completed Alt code on the Alt key release. The record is the
+                // only text-producing event in the sequence, so expose it as a semantic key press.
+                // Reporting it as a release causes consumers that correctly ignore key-up events
+                // to drop BMP Unicode input. Surrogate-pair Alt codes already take the press path
+                // through `handle_surrogate`, so this also makes BMP and non-BMP behavior agree.
+                let key_event = KeyEvent::new_with_kind(key_code, modifiers, KeyEventKind::Press);
                 return Some(WindowsKeyEvent::KeyEvent(key_event));
             }
         }
