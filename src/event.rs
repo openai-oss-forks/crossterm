@@ -125,12 +125,15 @@ pub(crate) mod source;
 #[cfg(feature = "event-stream")]
 pub(crate) mod stream;
 pub(crate) mod sys;
+mod terminal_response;
 pub(crate) mod timeout;
 
 #[cfg(feature = "derive-more")]
 use derive_more::derive::IsVariant;
 #[cfg(feature = "event-stream")]
 pub use stream::EventStream;
+#[cfg(feature = "event-stream")]
+pub use stream::{TerminalEvent, TerminalEventStream, drain_terminal_responses};
 
 use crate::{
     Command, csi,
@@ -229,7 +232,6 @@ pub fn poll(timeout: Duration) -> std::io::Result<bool> {
 pub fn read() -> std::io::Result<Event> {
     match internal::read(&EventFilter)? {
         InternalEvent::Event(event) => Ok(event),
-        #[cfg(unix)]
         _ => unreachable!(),
     }
 }
@@ -264,7 +266,7 @@ pub enum InputDiscardStatus {
     ControlSequenceInProgress,
 }
 
-/// Discard decoded events while preserving incomplete escape-sequence boundaries.
+/// Discard decoded input while preserving palette replies and incomplete escape boundaries.
 ///
 /// This does not flush the operating system's terminal input queue. Callers that need a clean
 /// input boundary should drain it through the event reader. If an incomplete bracketed paste or
@@ -304,7 +306,6 @@ pub fn try_read() -> Option<Event> {
     match internal::try_read(&EventFilter) {
         Some(InternalEvent::Event(event)) => Some(event),
         None => None,
-        #[cfg(unix)]
         _ => unreachable!(),
     }
 }

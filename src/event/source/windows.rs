@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crossterm_winapi::{Console, Handle, InputRecord};
@@ -18,6 +19,8 @@ use crate::event::{
 
 pub(crate) struct WindowsEventSource {
     console: Console,
+    response: Vec<crossterm_winapi::KeyEventRecord>,
+    ready: VecDeque<InternalEvent>,
     poll: WinApiPoll,
     surrogate_buffer: Option<u16>,
     mouse_buttons_pressed: MouseButtonsPressed,
@@ -28,6 +31,8 @@ impl WindowsEventSource {
         let console = Console::from(Handle::current_in_handle()?);
         Ok(WindowsEventSource {
             console,
+            response: Vec::new(),
+            ready: VecDeque::new(),
 
             #[cfg(not(feature = "event-stream"))]
             poll: WinApiPoll::new(),
@@ -40,17 +45,56 @@ impl WindowsEventSource {
     }
 }
 
+impl WindowsEventSource {
+    // Terminal replies use synthetic Unicode records; retain native virtual-key handling for
+    // navigation, modifiers, UTF-16, and mouse input. Incomplete replies are bounded.
+    fn handle_record(&mut self, record: crossterm_winapi::KeyEventRecord) {
+        if record.virtual_key_code == 0
+            && record.key_down
+            && record.u_char <= 127
+            && (record.u_char == 27 || !self.response.is_empty())
+        {
+            self.response.push(record);
+            let bytes: Vec<_> = self
+                .response
+                .iter()
+                .map(|record| record.u_char as u8)
+                .collect();
+            match crate::event::terminal_response::parse_console_response(&bytes) {
+                Ok(Some(event)) => {
+                    self.response.clear();
+                    self.ready.push_back(event);
+                    return;
+                }
+                Ok(None) => return,
+                Err(_) => {}
+            }
+            for record in self.response.drain(..) {
+                if let Some(event) = handle_key_event(record, &mut self.surrogate_buffer) {
+                    self.ready.push_back(InternalEvent::Event(event));
+                }
+            }
+        } else if let Some(event) = handle_key_event(record, &mut self.surrogate_buffer) {
+            self.ready.push_back(InternalEvent::Event(event));
+        }
+    }
+}
+
 impl EventSource for WindowsEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> std::io::Result<Option<InternalEvent>> {
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
+            if let Some(event) = self.ready.pop_front() {
+                return Ok(Some(event));
+            }
             if let Some(event_ready) = self.poll.poll(poll_timeout.leftover())? {
                 let number = self.console.number_of_console_input_events()?;
                 if event_ready && number != 0 {
                     let event = match self.console.read_single_input_event()? {
                         InputRecord::KeyEvent(record) => {
-                            handle_key_event(record, &mut self.surrogate_buffer)
+                            self.handle_record(record);
+                            None
                         }
                         InputRecord::MouseEvent(record) => {
                             let mouse_event =
