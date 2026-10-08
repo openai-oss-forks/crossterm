@@ -645,13 +645,27 @@ pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<I
         }
     }
 
-    // When the "report alternate keys" flag is enabled in the Kitty Keyboard Protocol
-    // and the terminal sends a keyboard event containing shift, the sequence will
-    // contain an additional codepoint separated by a ':' character which contains
-    // the shifted character according to the keyboard layout.
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        if let Some(shifted_c) = codepoints
-            .next()
+    let shifted_codepoint = codepoints.next();
+    let base_layout_codepoint = codepoints
+        .next()
+        .and_then(|codepoint| codepoint.parse::<u32>().ok())
+        .and_then(char::from_u32);
+
+    // Non-Latin Control/Super shortcuts need the base-layout key that Kitty
+    // reports (for example Thai Ctrl+แ is the physical Ctrl+C key). Keep
+    // ordinary text, AltGr, and ASCII layout shortcuts unchanged.
+    let shortcut_base = base_layout_codepoint.filter(|base| {
+        base.is_ascii()
+            && !base.is_ascii_control()
+            && matches!(keycode, KeyCode::Char(c) if !c.is_ascii())
+            && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            && !modifiers.contains(KeyModifiers::ALT)
+    });
+    if let Some(base) = shortcut_base {
+        keycode = KeyCode::Char(base);
+    } else if modifiers.contains(KeyModifiers::SHIFT) {
+        // Kitty's first alternate is the shifted character in the active layout.
+        if let Some(shifted_c) = shifted_codepoint
             .and_then(|codepoint| codepoint.parse::<u32>().ok())
             .and_then(char::from_u32)
         {
@@ -1516,6 +1530,77 @@ mod tests {
                 KeyModifiers::ALT,
             )))),
         );
+    }
+
+    #[test]
+    fn test_parse_non_latin_shortcuts_with_base_layout_key() {
+        for (sequence, modifiers, kind) in [
+            (
+                &b"\x1b[3649::99;5u"[..],
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            (
+                &b"\x1b[1089::99;5u"[..],
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            (
+                &b"\x1b[3649::99;5:2u"[..],
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+            (
+                &b"\x1b[3649::99;5:3u"[..],
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            ),
+            (
+                &b"\x1b[3649:3593:99;6u"[..],
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            ),
+            (
+                &b"\x1b[3649::99;9u"[..],
+                KeyModifiers::SUPER,
+                KeyEventKind::Press,
+            ),
+        ] {
+            assert_eq!(
+                parse_event(sequence, false).unwrap(),
+                Some(InternalEvent::Event(Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('c'),
+                    modifiers,
+                    kind,
+                )))),
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_base_layout_preserves_text_and_layout_specific_keys() {
+        for (sequence, code, modifiers) in [
+            (&b"\x1b[3649::99u"[..], 'แ', KeyModifiers::NONE),
+            (&b"\x1b[3649:3593:99;2u"[..], 'ฉ', KeyModifiers::NONE),
+            (
+                &b"\x1b[3649::99;7u"[..],
+                'แ',
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            (&b"\x1b[121::122;5u"[..], 'y', KeyModifiers::CONTROL),
+            (&b"\x1b[3649;5u"[..], 'แ', KeyModifiers::CONTROL),
+            (&b"\x1b[3649::bad;5u"[..], 'แ', KeyModifiers::CONTROL),
+            (&b"\x1b[3649::1114112;5u"[..], 'แ', KeyModifiers::CONTROL),
+            (&b"\x1b[3649::1089;5u"[..], 'แ', KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(
+                parse_event(sequence, false).unwrap(),
+                Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(code),
+                    modifiers,
+                )))),
+            );
+        }
     }
 
     #[test]
