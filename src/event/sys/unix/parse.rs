@@ -252,6 +252,9 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
                         return parse_csi_bracketed_paste(buffer);
                     }
                     match last_byte {
+                        b'n' if buffer == b"\x1b[0n" => {
+                            return Ok(Some(InternalEvent::OperatingStatus));
+                        }
                         b'M' => return parse_csi_rxvt_mouse(buffer),
                         b'~' => return parse_csi_special_key_code(buffer),
                         b'u' => return parse_csi_u_encoded_key_code(buffer),

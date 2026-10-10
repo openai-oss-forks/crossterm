@@ -131,6 +131,8 @@ pub(crate) mod timeout;
 use derive_more::derive::IsVariant;
 #[cfg(feature = "event-stream")]
 pub use stream::EventStream;
+#[cfg(all(unix, feature = "event-stream"))]
+pub use stream::{TerminalEvent, TerminalEventStream, drain_terminal_responses};
 
 use crate::{
     Command, csi,
@@ -238,7 +240,8 @@ pub fn read() -> std::io::Result<Event> {
 ///
 /// This allows a terminal query to inspect raw responses without discarding interleaved keyboard,
 /// paste, or focus events. Query responses are omitted because the caller already consumed them,
-/// and incomplete sequences remain buffered for the next terminal read.
+/// while input encoding evidence remains available to the terminal event stream. Incomplete
+/// sequences remain buffered for the next terminal read.
 ///
 /// Drop or pause all active `EventStream`s and other blocking event-reader users before calling this
 /// function. Event readers share a global lock, so a concurrently blocked reader can prevent it from
@@ -264,7 +267,7 @@ pub enum InputDiscardStatus {
     ControlSequenceInProgress,
 }
 
-/// Discard decoded events while preserving incomplete escape-sequence boundaries.
+/// Discard decoded input while preserving terminal replies and incomplete escape boundaries.
 ///
 /// This does not flush the operating system's terminal input queue. Callers that need a clean
 /// input boundary should drain it through the event reader. If an incomplete bracketed paste or

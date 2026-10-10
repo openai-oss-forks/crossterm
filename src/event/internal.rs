@@ -16,7 +16,7 @@ pub(crate) fn lock_event_reader() -> MappedMutexGuard<'static, InternalEventRead
     })
 }
 
-fn try_lock_event_reader_for(
+pub(crate) fn try_lock_event_reader_for(
     duration: Duration,
 ) -> Option<MappedMutexGuard<'static, InternalEventReader>> {
     Some(MutexGuard::map(
@@ -41,6 +41,24 @@ where
         (lock_event_reader(), None)
     };
     reader.poll(timeout, filter)
+}
+
+/// Check cancellation after acquiring the reader so a dropped stream cannot start another poll.
+/// A different input owner may have consumed the wake notification while this task waited for
+/// the lock; once the lock is held, a later cancellation wake can only reach this poll.
+#[cfg(feature = "event-stream")]
+pub(crate) fn poll_event_stream<F>(
+    filter: &F,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<bool>
+where
+    F: Filter,
+{
+    let mut reader = lock_event_reader();
+    if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(false);
+    }
+    reader.poll(None, filter)
 }
 
 /// Reads a single `InternalEvent`.
@@ -75,12 +93,38 @@ pub(crate) enum InternalEvent {
     /// The progressive keyboard enhancement flags enabled by the terminal.
     #[cfg(unix)]
     KeyboardEnhancementFlags(KeyboardEnhancementFlags),
+    /// A successfully decoded CSI-u key proves keyboard enhancement is already active.
+    #[cfg(unix)]
+    KeyboardEnhancementDetected,
     /// Attributes and architectural class of the terminal.
     #[cfg(unix)]
     PrimaryDeviceAttributes,
     /// OSC color response (`slot`, `payload`).
     #[cfg(unix)]
     OscColor { slot: u8, payload: OscColorPayload },
+    /// Successful operating-status reply (DSR 5).
+    #[cfg(unix)]
+    OperatingStatus,
+}
+
+impl InternalEvent {
+    /// Replay input and its encoding evidence, but not query replies already read by the caller.
+    #[cfg(unix)]
+    pub(crate) fn is_replayed_input(&self) -> bool {
+        matches!(self, Self::Event(_) | Self::KeyboardEnhancementDetected)
+    }
+
+    /// Keep capability replies and palette boundaries when an application quarantines user input.
+    #[cfg(unix)]
+    pub(crate) fn is_terminal_response(&self) -> bool {
+        matches!(
+            self,
+            Self::KeyboardEnhancementFlags(_)
+                | Self::KeyboardEnhancementDetected
+                | Self::OscColor { .. }
+                | Self::OperatingStatus
+        )
+    }
 }
 
 /// Parsed payload of an OSC color response.

@@ -54,8 +54,9 @@ impl InternalEventReader {
             .as_mut()
             .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
         let status = source.discard_buffered_input();
-        self.events.clear();
-        self.skipped_events.clear();
+        self.events.retain(InternalEvent::is_terminal_response);
+        self.skipped_events
+            .retain(InternalEvent::is_terminal_response);
         Ok(status)
     }
 
@@ -63,6 +64,44 @@ impl InternalEventReader {
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
         self.source.as_ref().expect("reader source not set").waker()
+    }
+
+    /// Discard matching events already available without waiting for new input.
+    ///
+    /// Drain the source directly: a zero-duration filtered poll stops after an unrelated event
+    /// and can leave a stale matching response behind it. Retain other events in their original
+    /// order, including events skipped by an earlier interrupted poll.
+    #[cfg(unix)]
+    pub(crate) fn discard_available<F>(
+        &mut self,
+        filter: &F,
+        timeout: &PollTimeout,
+    ) -> io::Result<()>
+    where
+        F: Filter,
+    {
+        self.events.retain(|event| !filter.eval(event));
+        self.events.extend(
+            self.skipped_events
+                .drain(..)
+                .filter(|event| !filter.eval(event)),
+        );
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
+        while !timeout.elapsed() {
+            let event = match source.try_read(Some(Duration::ZERO)) {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if !filter.eval(&event) {
+                self.events.push_back(event);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn poll<F>(&mut self, timeout: Option<Duration>, filter: &F) -> io::Result<bool>
@@ -81,6 +120,8 @@ impl InternalEventReader {
         };
 
         let poll_timeout = PollTimeout::new(timeout);
+        #[cfg(unix)]
+        let mut skipped_keyboard_evidence = false;
 
         loop {
             let maybe_event = match event_source.try_read(poll_timeout.leftover()) {
@@ -89,7 +130,17 @@ impl InternalEventReader {
                     if filter.eval(&event) {
                         Some(event)
                     } else {
+                        #[cfg(unix)]
+                        let keyboard_evidence =
+                            matches!(event, InternalEvent::KeyboardEnhancementDetected);
                         self.skipped_events.push(event);
+                        // Synthetic evidence precedes an already-decoded key. Let input-only
+                        // polling reach that key even with a zero timeout, once per poll.
+                        #[cfg(unix)]
+                        if keyboard_evidence && !skipped_keyboard_evidence {
+                            skipped_keyboard_evidence = true;
+                            continue;
+                        }
                         None
                     }
                 }
@@ -157,8 +208,10 @@ impl InternalEventReader {
             skipped_events.push(event);
         }
 
-        // push all skipped events back to the event queue
-        self.events.extend(skipped_events);
+        // Restore the skipped prefix before events that followed the matching event.
+        for event in skipped_events.into_iter().rev() {
+            self.events.push_front(event);
+        }
 
         result
     }
@@ -216,6 +269,91 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn zero_time_input_poll_reads_key_after_synthetic_keyboard_evidence() {
+        use crate::event::filter::EventFilter;
+        use crate::event::source::unix::UnixInternalEventSource;
+        use crate::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crate::terminal::sys::file_descriptor::FileDesc;
+        use std::{io::Write, os::unix::net::UnixStream};
+
+        let (input, mut writer) = UnixStream::pair().unwrap();
+        #[cfg(feature = "libc")]
+        let input = {
+            use std::os::fd::IntoRawFd;
+            FileDesc::new(input.into_raw_fd(), true)
+        };
+        #[cfg(not(feature = "libc"))]
+        let input = FileDesc::Owned(input.into());
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(
+                UnixInternalEventSource::from_file_descriptor(input).unwrap(),
+            )),
+            skipped_events: Vec::new(),
+        };
+        writer.write_all(b"\x1b[120;3u").unwrap();
+
+        assert!(reader.poll(Some(Duration::ZERO), &EventFilter).unwrap());
+        assert_eq!(
+            reader.read(&EventFilter).unwrap(),
+            InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::ALT,
+            ))),
+        );
+        assert_eq!(
+            reader.read(&InternalEventFilter).unwrap(),
+            InternalEvent::KeyboardEnhancementDetected,
+        );
+        assert!(!reader.poll(Some(Duration::ZERO), &EventFilter).unwrap());
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "event-stream"))]
+    fn zero_time_response_drain_stops_after_a_non_status_reply() {
+        use crate::event::source::unix::UnixInternalEventSource;
+        use crate::event::{KeyCode, internal};
+        use crate::terminal::sys::file_descriptor::FileDesc;
+        use std::{io::Write, os::unix::net::UnixStream};
+
+        let (input, mut writer) = UnixStream::pair().unwrap();
+        #[cfg(feature = "libc")]
+        let input = {
+            use std::os::fd::IntoRawFd;
+            FileDesc::new(input.into_raw_fd(), true)
+        };
+        #[cfg(not(feature = "libc"))]
+        let input = FileDesc::Owned(input.into());
+        let reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(
+                UnixInternalEventSource::from_file_descriptor(input).unwrap(),
+            )),
+            skipped_events: Vec::new(),
+        };
+        writer
+            .write_all(b"\x1b]10;rgb:ff/ff/ff\x1b\\\x1b[0nx")
+            .unwrap();
+        let original = std::mem::replace(&mut *internal::lock_event_reader(), reader);
+
+        let first = crate::event::drain_terminal_responses(Duration::ZERO);
+        let boundary = crate::event::drain_terminal_responses(Duration::ZERO);
+        let input_ready = crate::event::poll(Duration::ZERO);
+        let input = if matches!(input_ready, Ok(true)) {
+            crate::event::read().map(Some)
+        } else {
+            Ok(None)
+        };
+        *internal::lock_event_reader() = original;
+
+        assert_eq!(first.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(boundary.is_ok());
+        assert!(input_ready.unwrap());
+        assert_eq!(input.unwrap(), Some(Event::Key(KeyCode::Char('x').into())));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_poll_returns_true_for_matching_event_in_queue_at_back() {
         let mut reader = InternalEventReader {
             events: vec![
@@ -260,17 +398,33 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_read_does_not_consume_skipped_event() {
-        const SKIPPED_EVENT: InternalEvent = InternalEvent::Event(Event::Resize(10, 10));
+        use crate::event::{KeyCode, KeyboardEnhancementFlags, internal::OscColorPayload};
+
         const CURSOR_EVENT: InternalEvent = InternalEvent::CursorPosition(10, 20);
+        let retained = vec![
+            InternalEvent::Event(Event::Key(KeyCode::Char('a').into())),
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
+            },
+            InternalEvent::KeyboardEnhancementDetected,
+            InternalEvent::KeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ),
+            InternalEvent::OperatingStatus,
+            InternalEvent::Event(Event::Key(KeyCode::Char('b').into())),
+        ];
+        let mut events = retained.clone();
+        events.insert(3, CURSOR_EVENT);
 
         let mut reader = InternalEventReader {
-            events: vec![SKIPPED_EVENT, CURSOR_EVENT].into(),
+            events: events.into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
         };
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
-        assert_eq!(reader.read(&InternalEventFilter).unwrap(), SKIPPED_EVENT);
+        assert_eq!(reader.events, retained);
     }
 
     #[test]
@@ -297,10 +451,58 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn discard_available_removes_stale_cursor_replies_after_unrelated_input() {
+        let old_position = InternalEvent::CursorPosition(3, 2);
+        let fresh_position = InternalEvent::CursorPosition(11, 7);
+        let input = InternalEvent::Event(Event::Key(crate::event::KeyCode::Char('a').into()));
+        let mut reader = InternalEventReader {
+            events: VecDeque::from([old_position.clone(), input.clone()]),
+            skipped_events: vec![InternalEvent::OperatingStatus, old_position.clone()],
+            source: Some(Box::new(FakeSource {
+                events: VecDeque::from([
+                    input.clone(),
+                    old_position,
+                    InternalEvent::KeyboardEnhancementDetected,
+                ]),
+                error: Some(io::Error::new(io::ErrorKind::Interrupted, "reader paused")),
+            })),
+        };
+        let retained = VecDeque::from([
+            input.clone(),
+            InternalEvent::OperatingStatus,
+            input,
+            InternalEvent::KeyboardEnhancementDetected,
+        ]);
+
+        reader
+            .discard_available(
+                &CursorPositionFilter,
+                &super::PollTimeout::new(Some(Duration::from_secs(1))),
+            )
+            .unwrap();
+        assert_eq!(reader.events, retained);
+        assert!(reader.skipped_events.is_empty());
+
+        // A fresh request can now accept only its new reply, while all other input stays queued.
+        reader.source = Some(Box::new(FakeSource::with_events(std::slice::from_ref(
+            &fresh_position,
+        ))));
+        assert!(
+            reader
+                .poll(Some(Duration::ZERO), &CursorPositionFilter)
+                .unwrap()
+        );
+        assert_eq!(reader.try_read(&CursorPositionFilter), Some(fresh_position));
+        assert_eq!(reader.events, retained);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_buffer_input_preserves_events_around_terminal_responses() {
         let input = [
             InternalEvent::Event(Event::Resize(10, 10)),
             InternalEvent::CursorPosition(4, 8),
+            InternalEvent::KeyboardEnhancementDetected,
             InternalEvent::Event(Event::Resize(20, 20)),
         ];
         let mut reader = InternalEventReader {
@@ -315,6 +517,7 @@ mod tests {
             reader.events,
             VecDeque::from([
                 InternalEvent::Event(Event::Resize(10, 10)),
+                InternalEvent::KeyboardEnhancementDetected,
                 InternalEvent::Event(Event::Resize(20, 20)),
             ])
         );
@@ -322,13 +525,24 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_discard_buffered_input_clears_all_event_queues() {
+    fn test_discard_buffered_input_clears_input_and_retains_terminal_responses() {
+        let keyboard_reply = InternalEvent::KeyboardEnhancementFlags(
+            crate::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        );
         let mut reader = InternalEventReader {
-            events: VecDeque::from([InternalEvent::Event(Event::Resize(10, 10))]),
+            events: VecDeque::from([
+                InternalEvent::Event(Event::Resize(10, 10)),
+                InternalEvent::OperatingStatus,
+                keyboard_reply.clone(),
+            ]),
             source: Some(Box::new(FakeSource::with_events(&[InternalEvent::Event(
                 Event::Resize(20, 20),
             )]))),
-            skipped_events: vec![InternalEvent::CursorPosition(4, 8)],
+            skipped_events: vec![
+                InternalEvent::CursorPosition(4, 8),
+                InternalEvent::OperatingStatus,
+                keyboard_reply.clone(),
+            ],
         };
 
         assert_eq!(
@@ -336,8 +550,14 @@ mod tests {
             super::InputDiscardStatus::Complete
         );
 
-        assert!(reader.events.is_empty());
-        assert!(reader.skipped_events.is_empty());
+        assert_eq!(
+            reader.events,
+            [InternalEvent::OperatingStatus, keyboard_reply.clone()]
+        );
+        assert_eq!(
+            reader.skipped_events,
+            [InternalEvent::OperatingStatus, keyboard_reply]
+        );
         assert_eq!(
             reader
                 .source
@@ -560,7 +780,7 @@ mod tests {
             events.extend(
                 self.events
                     .drain(..)
-                    .filter(|event| matches!(event, InternalEvent::Event(_))),
+                    .filter(InternalEvent::is_replayed_input),
             );
         }
 

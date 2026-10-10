@@ -32,6 +32,7 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
     events: Events,
+    pending_events: VecDeque<Token>,
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
@@ -63,6 +64,7 @@ impl UnixInternalEventSource {
         Ok(UnixInternalEventSource {
             poll,
             events: Events::with_capacity(3),
+            pending_events: VecDeque::with_capacity(3),
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
@@ -82,9 +84,12 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if self.pending_tty_readable {
-                self.pending_tty_readable = false;
-            } else {
+            // Finish the previous readiness batch before returning to a readable TTY. A wake
+            // behind a cursor reply must still interrupt a filtered, otherwise unbounded poll.
+            if self.pending_events.is_empty() && std::mem::take(&mut self.pending_tty_readable) {
+                self.pending_events.push_back(TTY_TOKEN);
+            }
+            if self.pending_events.is_empty() {
                 let poll_timeout = self.parser.poll_timeout(timeout.leftover());
                 if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
                     // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
@@ -96,14 +101,15 @@ impl EventSource for UnixInternalEventSource {
                         return Err(e);
                     }
                 }
-
                 if self.events.is_empty() {
                     // No readiness events = timeout
                     return Ok(self.parser.finish_pending_escape());
                 }
+                self.pending_events
+                    .extend(self.events.iter().map(mio::event::Event::token));
             }
 
-            for token in self.events.iter().map(|x| x.token()) {
+            while let Some(token) = self.pending_events.pop_front() {
                 match token {
                     TTY_TOKEN => {
                         loop {
@@ -128,14 +134,15 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
-                            if let Some(event) = self.parser.next() {
-                                return Ok(Some(event));
-                            }
-
                             // The source owns this descriptor for the lifetime of its borrow.
                             let fd =
                                 unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
-                            if rustix::io::ioctl_fionread(fd)? == 0 {
+                            let unread_bytes = rustix::io::ioctl_fionread(fd)?;
+                            if let Some(event) = self.parser.next() {
+                                self.pending_tty_readable = unread_bytes > 0;
+                                return Ok(Some(event));
+                            }
+                            if unread_bytes == 0 {
                                 break;
                             }
                             if timeout.elapsed() {
@@ -181,7 +188,7 @@ impl EventSource for UnixInternalEventSource {
         events.extend(
             self.parser
                 .by_ref()
-                .filter(|event| matches!(event, InternalEvent::Event(_))),
+                .filter(InternalEvent::is_replayed_input),
         );
     }
 
@@ -207,6 +214,7 @@ struct Parser {
     internal_events: VecDeque<InternalEvent>,
     pending_escape_deadline: Option<Instant>,
     discarded_sequence: Option<DiscardedSequence>,
+    reported_keyboard_enhancement: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +224,7 @@ enum DiscardedSequence {
     OscBody,
     OscEscape,
     Csi,
+    OperatingStatus,
     X10Mouse(usize),
     Ss3,
 }
@@ -242,6 +251,7 @@ impl Default for Parser {
             internal_events: VecDeque::with_capacity(128),
             pending_escape_deadline: None,
             discarded_sequence: None,
+            reported_keyboard_enhancement: false,
         }
     }
 }
@@ -265,6 +275,8 @@ impl Parser {
                 });
             } else if self.buffer.starts_with(b"\x1b[M") {
                 self.discarded_sequence = Some(DiscardedSequence::X10Mouse(6 - self.buffer.len()));
+            } else if self.buffer == b"\x1b[0" {
+                self.discarded_sequence = Some(DiscardedSequence::OperatingStatus);
             } else if self.buffer.starts_with(b"\x1b[") {
                 self.discarded_sequence = Some(DiscardedSequence::Csi);
             } else if self.buffer.starts_with(b"\x1bO") {
@@ -272,7 +284,8 @@ impl Parser {
             }
         }
         self.buffer.clear();
-        self.internal_events.clear();
+        self.internal_events
+            .retain(InternalEvent::is_terminal_response);
         self.pending_escape_deadline = None;
         match self.discarded_sequence {
             Some(DiscardedSequence::PasteStart(_) | DiscardedSequence::PasteBody(_)) => {
@@ -338,6 +351,9 @@ impl Parser {
                     DiscardedSequence::PasteStart(2) if *byte == b'[' => {
                         Some(DiscardedSequence::Csi)
                     }
+                    DiscardedSequence::PasteStart(2) if *byte == b'0' => {
+                        Some(DiscardedSequence::OperatingStatus)
+                    }
                     DiscardedSequence::PasteStart(matched)
                         if matched >= 2 && !(0x40..=0x7e).contains(byte) =>
                     {
@@ -371,15 +387,29 @@ impl Parser {
                     DiscardedSequence::OscBody | DiscardedSequence::OscEscape => {
                         Some(DiscardedSequence::OscBody)
                     }
-                    DiscardedSequence::Csi | DiscardedSequence::Ss3 if *byte == b'\x1b' => {
+                    DiscardedSequence::OperatingStatus if *byte == b'n' => {
+                        // Preserve the protocol boundary without releasing quarantined input.
+                        self.internal_events
+                            .push_back(InternalEvent::OperatingStatus);
+                        None
+                    }
+                    DiscardedSequence::Csi
+                    | DiscardedSequence::OperatingStatus
+                    | DiscardedSequence::Ss3
+                        if *byte == b'\x1b' =>
+                    {
                         Some(DiscardedSequence::PasteStart(1))
                     }
-                    DiscardedSequence::Csi | DiscardedSequence::Ss3
+                    DiscardedSequence::Csi
+                    | DiscardedSequence::OperatingStatus
+                    | DiscardedSequence::Ss3
                         if (0x40..=0x7e).contains(byte) =>
                     {
                         None
                     }
-                    DiscardedSequence::Csi => Some(DiscardedSequence::Csi),
+                    DiscardedSequence::Csi | DiscardedSequence::OperatingStatus => {
+                        Some(DiscardedSequence::Csi)
+                    }
                     DiscardedSequence::X10Mouse(remaining) if remaining > 1 => {
                         Some(DiscardedSequence::X10Mouse(remaining - 1))
                     }
@@ -394,6 +424,15 @@ impl Parser {
 
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {
+                    if !self.reported_keyboard_enhancement
+                        && self.buffer.starts_with(b"\x1b[")
+                        && self.buffer.ends_with(b"u")
+                        && matches!(ie, InternalEvent::Event(Event::Key(_)))
+                    {
+                        self.reported_keyboard_enhancement = true;
+                        self.internal_events
+                            .push_back(InternalEvent::KeyboardEnhancementDetected);
+                    }
                     self.internal_events.push_back(ie);
                     self.buffer.clear();
                 }
@@ -436,6 +475,14 @@ impl Iterator for Parser {
 mod secondary_device_attributes_tests;
 
 #[cfg(test)]
+#[path = "../discarded_status_tests.rs"]
+mod discarded_status_tests;
+
+#[cfg(test)]
+#[path = "../startup_reply_tests.rs"]
+mod startup_reply_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Parser, UnixInternalEventSource};
     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
@@ -455,6 +502,61 @@ mod tests {
             UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
             writer,
         )
+    }
+
+    #[cfg(feature = "event-stream")]
+    #[test]
+    fn reader_wakeup_preserves_ready_quarantined_input() {
+        let (mut source, mut writer) = source_with_input();
+        source.parser.buffer_external_input(b"\x1b[?");
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::ControlSequenceInProgress,
+        );
+        source.waker().wake().unwrap();
+        writer.write_all(b"7un").unwrap();
+
+        loop {
+            match source.try_read(Some(Duration::ZERO)) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => {
+                    assert_eq!(
+                        result.unwrap(),
+                        Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into()))),
+                    );
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::Complete
+        );
+    }
+
+    #[cfg(feature = "event-stream")]
+    #[test]
+    fn parsed_cursor_reply_preserves_a_later_wakeup_in_the_same_batch() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"\x1b[3;4R").unwrap();
+        source.waker().wake().unwrap();
+        source
+            .poll
+            .poll(&mut source.events, Some(Duration::ZERO))
+            .unwrap();
+        // Exercise this readiness order explicitly; the OS may deliver either token first.
+        source
+            .pending_events
+            .extend([super::TTY_TOKEN, super::WAKE_TOKEN]);
+
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::CursorPosition(3, 2)),
+        );
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted,
+        );
     }
 
     #[test]
@@ -487,6 +589,7 @@ mod tests {
     fn discarded_escape_suppresses_a_delayed_modifier_suffix() {
         for suffix in *b"y1" {
             let mut parser = Parser::default();
+            parser.advance(b"\x1b[0n", false);
             parser.buffer_external_input(b"\x1b");
             parser.pending_escape_deadline = Some(Instant::now());
 
@@ -495,6 +598,7 @@ mod tests {
                 InputDiscardStatus::BracketedPasteInProgress
             );
             assert_eq!(parser.finish_pending_escape(), None);
+            assert_eq!(parser.next(), Some(InternalEvent::OperatingStatus));
             parser.advance(std::slice::from_ref(&suffix), false);
 
             assert_eq!(parser.next(), None);

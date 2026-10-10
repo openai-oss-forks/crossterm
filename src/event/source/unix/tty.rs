@@ -132,9 +132,12 @@ impl EventSource for UnixInternalEventSource {
             make_pollfd(&self.wake_pipe.receiver),
         ];
 
-        while timeout.leftover().is_none_or(|t| !t.is_zero())
+        let mut first_poll = true;
+        while first_poll
+            || timeout.leftover().is_none_or(|t| !t.is_zero())
             || self.parser.pending_escape_expired()
         {
+            first_poll = false;
             // check if there are buffered events from the last read
             if let Some(event) = self.parser.next() {
                 return Ok(Some(event));
@@ -223,7 +226,7 @@ impl EventSource for UnixInternalEventSource {
         events.extend(
             self.parser
                 .by_ref()
-                .filter(|event| matches!(event, InternalEvent::Event(_))),
+                .filter(InternalEvent::is_replayed_input),
         );
     }
 
@@ -249,6 +252,7 @@ struct Parser {
     internal_events: VecDeque<InternalEvent>,
     pending_escape_deadline: Option<Instant>,
     discarded_sequence: Option<DiscardedSequence>,
+    reported_keyboard_enhancement: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -258,6 +262,7 @@ enum DiscardedSequence {
     OscBody,
     OscEscape,
     Csi,
+    OperatingStatus,
     X10Mouse(usize),
     Ss3,
 }
@@ -284,6 +289,7 @@ impl Default for Parser {
             internal_events: VecDeque::with_capacity(128),
             pending_escape_deadline: None,
             discarded_sequence: None,
+            reported_keyboard_enhancement: false,
         }
     }
 }
@@ -307,6 +313,8 @@ impl Parser {
                 });
             } else if self.buffer.starts_with(b"\x1b[M") {
                 self.discarded_sequence = Some(DiscardedSequence::X10Mouse(6 - self.buffer.len()));
+            } else if self.buffer == b"\x1b[0" {
+                self.discarded_sequence = Some(DiscardedSequence::OperatingStatus);
             } else if self.buffer.starts_with(b"\x1b[") {
                 self.discarded_sequence = Some(DiscardedSequence::Csi);
             } else if self.buffer.starts_with(b"\x1bO") {
@@ -314,7 +322,8 @@ impl Parser {
             }
         }
         self.buffer.clear();
-        self.internal_events.clear();
+        self.internal_events
+            .retain(InternalEvent::is_terminal_response);
         self.pending_escape_deadline = None;
         match self.discarded_sequence {
             Some(DiscardedSequence::PasteStart(_) | DiscardedSequence::PasteBody(_)) => {
@@ -385,6 +394,9 @@ impl Parser {
                     DiscardedSequence::PasteStart(2) if *byte == b'[' => {
                         Some(DiscardedSequence::Csi)
                     }
+                    DiscardedSequence::PasteStart(2) if *byte == b'0' => {
+                        Some(DiscardedSequence::OperatingStatus)
+                    }
                     DiscardedSequence::PasteStart(matched)
                         if matched >= 2 && !(0x40..=0x7e).contains(byte) =>
                     {
@@ -418,15 +430,29 @@ impl Parser {
                     DiscardedSequence::OscBody | DiscardedSequence::OscEscape => {
                         Some(DiscardedSequence::OscBody)
                     }
-                    DiscardedSequence::Csi | DiscardedSequence::Ss3 if *byte == b'\x1b' => {
+                    DiscardedSequence::OperatingStatus if *byte == b'n' => {
+                        // Preserve the protocol boundary without releasing quarantined input.
+                        self.internal_events
+                            .push_back(InternalEvent::OperatingStatus);
+                        None
+                    }
+                    DiscardedSequence::Csi
+                    | DiscardedSequence::OperatingStatus
+                    | DiscardedSequence::Ss3
+                        if *byte == b'\x1b' =>
+                    {
                         Some(DiscardedSequence::PasteStart(1))
                     }
-                    DiscardedSequence::Csi | DiscardedSequence::Ss3
+                    DiscardedSequence::Csi
+                    | DiscardedSequence::OperatingStatus
+                    | DiscardedSequence::Ss3
                         if (0x40..=0x7e).contains(byte) =>
                     {
                         None
                     }
-                    DiscardedSequence::Csi => Some(DiscardedSequence::Csi),
+                    DiscardedSequence::Csi | DiscardedSequence::OperatingStatus => {
+                        Some(DiscardedSequence::Csi)
+                    }
                     DiscardedSequence::X10Mouse(remaining) if remaining > 1 => {
                         Some(DiscardedSequence::X10Mouse(remaining - 1))
                     }
@@ -441,6 +467,15 @@ impl Parser {
 
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {
+                    if !self.reported_keyboard_enhancement
+                        && self.buffer.starts_with(b"\x1b[")
+                        && self.buffer.ends_with(b"u")
+                        && matches!(ie, InternalEvent::Event(Event::Key(_)))
+                    {
+                        self.reported_keyboard_enhancement = true;
+                        self.internal_events
+                            .push_back(InternalEvent::KeyboardEnhancementDetected);
+                    }
                     self.internal_events.push_back(ie);
                     self.buffer.clear();
                 }
@@ -483,6 +518,14 @@ impl Iterator for Parser {
 mod secondary_device_attributes_tests;
 
 #[cfg(test)]
+#[path = "../discarded_status_tests.rs"]
+mod discarded_status_tests;
+
+#[cfg(test)]
+#[path = "../startup_reply_tests.rs"]
+mod startup_reply_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Parser, UnixInternalEventSource};
     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
@@ -502,6 +545,21 @@ mod tests {
             UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
             writer,
         )
+    }
+
+    #[test]
+    fn zero_timeout_reads_available_input_and_buffered_cursor_replies() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"a\x1b[3;4R").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('a').into()))),
+        );
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::CursorPosition(3, 2)),
+        );
+        assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), None);
     }
 
     #[test]
@@ -534,6 +592,7 @@ mod tests {
     fn discarded_escape_suppresses_a_delayed_modifier_suffix() {
         for suffix in *b"y1" {
             let mut parser = Parser::default();
+            parser.advance(b"\x1b[0n", false);
             parser.buffer_external_input(b"\x1b");
             parser.pending_escape_deadline = Some(Instant::now());
 
@@ -542,6 +601,7 @@ mod tests {
                 InputDiscardStatus::BracketedPasteInProgress
             );
             assert_eq!(parser.finish_pending_escape(), None);
+            assert_eq!(parser.next(), Some(InternalEvent::OperatingStatus));
             parser.advance(std::slice::from_ref(&suffix), false);
 
             assert_eq!(parser.next(), None);
