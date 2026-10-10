@@ -32,6 +32,7 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
     events: Events,
+    pending_events: VecDeque<Token>,
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
@@ -39,8 +40,6 @@ pub(crate) struct UnixInternalEventSource {
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
-    #[cfg(feature = "event-stream")]
-    wake_consumed: bool,
 }
 
 impl UnixInternalEventSource {
@@ -65,6 +64,7 @@ impl UnixInternalEventSource {
         Ok(UnixInternalEventSource {
             poll,
             events: Events::with_capacity(3),
+            pending_events: VecDeque::with_capacity(3),
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
@@ -72,8 +72,6 @@ impl UnixInternalEventSource {
             signals,
             #[cfg(feature = "event-stream")]
             waker,
-            #[cfg(feature = "event-stream")]
-            wake_consumed: false,
         })
     }
 }
@@ -86,8 +84,12 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            let resuming_tty = std::mem::take(&mut self.pending_tty_readable);
-            if !resuming_tty {
+            // Finish the previous readiness batch before returning to a readable TTY. A wake
+            // behind a cursor reply must still interrupt a filtered, otherwise unbounded poll.
+            if self.pending_events.is_empty() && std::mem::take(&mut self.pending_tty_readable) {
+                self.pending_events.push_back(TTY_TOKEN);
+            }
+            if self.pending_events.is_empty() {
                 let poll_timeout = self.parser.poll_timeout(timeout.leftover());
                 if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
                     // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
@@ -99,18 +101,15 @@ impl EventSource for UnixInternalEventSource {
                         return Err(e);
                     }
                 }
-                #[cfg(feature = "event-stream")]
-                {
-                    self.wake_consumed = false;
-                }
-
                 if self.events.is_empty() {
                     // No readiness events = timeout
                     return Ok(self.parser.finish_pending_escape());
                 }
+                self.pending_events
+                    .extend(self.events.iter().map(mio::event::Event::token));
             }
 
-            for token in self.events.iter().map(|event| event.token()) {
+            while let Some(token) = self.pending_events.pop_front() {
                 match token {
                     TTY_TOKEN => {
                         loop {
@@ -135,14 +134,15 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
-                            if let Some(event) = self.parser.next() {
-                                return Ok(Some(event));
-                            }
-
                             // The source owns this descriptor for the lifetime of its borrow.
                             let fd =
                                 unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
-                            if rustix::io::ioctl_fionread(fd)? == 0 {
+                            let unread_bytes = rustix::io::ioctl_fionread(fd)?;
+                            if let Some(event) = self.parser.next() {
+                                self.pending_tty_readable = unread_bytes > 0;
+                                return Ok(Some(event));
+                            }
+                            if unread_bytes == 0 {
                                 break;
                             }
                             if timeout.elapsed() {
@@ -166,18 +166,7 @@ impl EventSource for UnixInternalEventSource {
                         }
                     }
                     #[cfg(feature = "event-stream")]
-                    WAKE_TOKEN if self.wake_consumed => {}
-                    #[cfg(feature = "event-stream")]
                     WAKE_TOKEN => {
-                        // Returning here must not lose a later TTY readiness edge in this batch.
-                        // Resume that batch on the next read, skipping this consumed wake token.
-                        self.wake_consumed = true;
-                        self.pending_tty_readable = self
-                            .events
-                            .iter()
-                            .skip_while(|event| event.token() != WAKE_TOKEN)
-                            .skip(1)
-                            .any(|event| event.token() == TTY_TOKEN);
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
                             "Poll operation was woken up by `Waker::wake`",
@@ -542,6 +531,31 @@ mod tests {
         assert_eq!(
             source.discard_buffered_input(),
             InputDiscardStatus::Complete
+        );
+    }
+
+    #[cfg(feature = "event-stream")]
+    #[test]
+    fn parsed_cursor_reply_preserves_a_later_wakeup_in_the_same_batch() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"\x1b[3;4R").unwrap();
+        source.waker().wake().unwrap();
+        source
+            .poll
+            .poll(&mut source.events, Some(Duration::ZERO))
+            .unwrap();
+        // Exercise this readiness order explicitly; the OS may deliver either token first.
+        source
+            .pending_events
+            .extend([super::TTY_TOKEN, super::WAKE_TOKEN]);
+
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::CursorPosition(3, 2)),
+        );
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted,
         );
     }
 

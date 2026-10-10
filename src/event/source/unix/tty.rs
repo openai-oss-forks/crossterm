@@ -132,9 +132,12 @@ impl EventSource for UnixInternalEventSource {
             make_pollfd(&self.wake_pipe.receiver),
         ];
 
-        while timeout.leftover().is_none_or(|t| !t.is_zero())
+        let mut first_poll = true;
+        while first_poll
+            || timeout.leftover().is_none_or(|t| !t.is_zero())
             || self.parser.pending_escape_expired()
         {
+            first_poll = false;
             // check if there are buffered events from the last read
             if let Some(event) = self.parser.next() {
                 return Ok(Some(event));
@@ -542,6 +545,21 @@ mod tests {
             UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
             writer,
         )
+    }
+
+    #[test]
+    fn zero_timeout_reads_available_input_and_buffered_cursor_replies() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"a\x1b[3;4R").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('a').into()))),
+        );
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::CursorPosition(3, 2)),
+        );
+        assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), None);
     }
 
     #[test]
