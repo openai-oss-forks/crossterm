@@ -50,6 +50,8 @@ pub(crate) mod sys;
 
 #[cfg(feature = "events")]
 pub use sys::position;
+#[cfg(all(unix, feature = "events"))]
+pub use sys::position_with_timeout;
 
 /// A command that moves the terminal cursor to the given position (column, row).
 ///

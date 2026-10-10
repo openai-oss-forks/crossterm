@@ -16,7 +16,7 @@ pub(crate) fn lock_event_reader() -> MappedMutexGuard<'static, InternalEventRead
     })
 }
 
-fn try_lock_event_reader_for(
+pub(crate) fn try_lock_event_reader_for(
     duration: Duration,
 ) -> Option<MappedMutexGuard<'static, InternalEventReader>> {
     Some(MutexGuard::map(

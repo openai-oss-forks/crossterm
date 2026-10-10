@@ -158,8 +158,10 @@ impl InternalEventReader {
             skipped_events.push(event);
         }
 
-        // push all skipped events back to the event queue
-        self.events.extend(skipped_events);
+        // Restore the skipped prefix before events that followed the matching event.
+        for event in skipped_events.into_iter().rev() {
+            self.events.push_front(event);
+        }
 
         result
     }
@@ -261,17 +263,33 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_read_does_not_consume_skipped_event() {
-        const SKIPPED_EVENT: InternalEvent = InternalEvent::Event(Event::Resize(10, 10));
+        use crate::event::{KeyCode, KeyboardEnhancementFlags, internal::OscColorPayload};
+
         const CURSOR_EVENT: InternalEvent = InternalEvent::CursorPosition(10, 20);
+        let retained = vec![
+            InternalEvent::Event(Event::Key(KeyCode::Char('a').into())),
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
+            },
+            InternalEvent::KeyboardEnhancementDetected,
+            InternalEvent::KeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ),
+            InternalEvent::OperatingStatus,
+            InternalEvent::Event(Event::Key(KeyCode::Char('b').into())),
+        ];
+        let mut events = retained.clone();
+        events.insert(3, CURSOR_EVENT);
 
         let mut reader = InternalEventReader {
-            events: vec![SKIPPED_EVENT, CURSOR_EVENT].into(),
+            events: events.into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
         };
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
-        assert_eq!(reader.read(&InternalEventFilter).unwrap(), SKIPPED_EVENT);
+        assert_eq!(reader.events, retained);
     }
 
     #[test]

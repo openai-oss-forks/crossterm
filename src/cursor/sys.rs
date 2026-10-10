@@ -3,6 +3,8 @@
 #[cfg(unix)]
 #[cfg(feature = "events")]
 pub use self::unix::position;
+#[cfg(all(unix, feature = "events"))]
+pub use self::unix::position_with_timeout;
 #[cfg(windows)]
 #[cfg(feature = "events")]
 pub use self::windows::position;
