@@ -302,6 +302,7 @@ mod tests {
         let input = [
             InternalEvent::Event(Event::Resize(10, 10)),
             InternalEvent::CursorPosition(4, 8),
+            InternalEvent::KeyboardEnhancementDetected,
             InternalEvent::Event(Event::Resize(20, 20)),
         ];
         let mut reader = InternalEventReader {
@@ -316,6 +317,7 @@ mod tests {
             reader.events,
             VecDeque::from([
                 InternalEvent::Event(Event::Resize(10, 10)),
+                InternalEvent::KeyboardEnhancementDetected,
                 InternalEvent::Event(Event::Resize(20, 20)),
             ])
         );
@@ -578,7 +580,7 @@ mod tests {
             events.extend(
                 self.events
                     .drain(..)
-                    .filter(|event| matches!(event, InternalEvent::Event(_))),
+                    .filter(InternalEvent::is_replayed_input),
             );
         }
 

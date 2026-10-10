@@ -240,7 +240,8 @@ pub fn read() -> std::io::Result<Event> {
 ///
 /// This allows a terminal query to inspect raw responses without discarding interleaved keyboard,
 /// paste, or focus events. Query responses are omitted because the caller already consumed them,
-/// and incomplete sequences remain buffered for the next terminal read.
+/// while input encoding evidence remains available to the terminal event stream. Incomplete
+/// sequences remain buffered for the next terminal read.
 ///
 /// Drop or pause all active `EventStream`s and other blocking event-reader users before calling this
 /// function. Event readers share a global lock, so a concurrently blocked reader can prevent it from

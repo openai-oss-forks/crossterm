@@ -165,7 +165,11 @@ impl Filter for StreamFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
         #[cfg(unix)]
         if matches!(self, Self::Terminal)
-            && matches!(event, InternalEvent::KeyboardEnhancementFlags(_))
+            && matches!(
+                event,
+                InternalEvent::KeyboardEnhancementFlags(_)
+                    | InternalEvent::KeyboardEnhancementDetected
+            )
         {
             return true;
         }
@@ -191,6 +195,12 @@ pub enum TerminalEvent {
     /// Reply to a progressive keyboard enhancement query (`CSI ? u`).
     #[cfg(unix)]
     KeyboardEnhancementFlags(super::KeyboardEnhancementFlags),
+    /// The input reader decoded its first CSI-u key, before delivering that key.
+    ///
+    /// This encoding proves keyboard enhancement is active even if the query reply is delayed;
+    /// it does not report which enhancement flags the terminal has enabled.
+    #[cfg(unix)]
+    KeyboardEnhancementDetected,
     /// An OSC color response. An unrecognized color is reported as `None`.
     Color {
         slot: u8,
@@ -228,6 +238,10 @@ impl Stream for TerminalEventStream {
                     #[cfg(unix)]
                     InternalEvent::KeyboardEnhancementFlags(flags) => {
                         TerminalEvent::KeyboardEnhancementFlags(flags)
+                    }
+                    #[cfg(unix)]
+                    InternalEvent::KeyboardEnhancementDetected => {
+                        TerminalEvent::KeyboardEnhancementDetected
                     }
                     InternalEvent::OscColor { slot, payload } => TerminalEvent::Color {
                         slot,

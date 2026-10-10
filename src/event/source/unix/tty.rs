@@ -223,7 +223,7 @@ impl EventSource for UnixInternalEventSource {
         events.extend(
             self.parser
                 .by_ref()
-                .filter(|event| matches!(event, InternalEvent::Event(_))),
+                .filter(InternalEvent::is_replayed_input),
         );
     }
 
@@ -249,6 +249,7 @@ struct Parser {
     internal_events: VecDeque<InternalEvent>,
     pending_escape_deadline: Option<Instant>,
     discarded_sequence: Option<DiscardedSequence>,
+    reported_keyboard_enhancement: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +286,7 @@ impl Default for Parser {
             internal_events: VecDeque::with_capacity(128),
             pending_escape_deadline: None,
             discarded_sequence: None,
+            reported_keyboard_enhancement: false,
         }
     }
 }
@@ -462,6 +464,15 @@ impl Parser {
 
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {
+                    if !self.reported_keyboard_enhancement
+                        && self.buffer.starts_with(b"\x1b[")
+                        && self.buffer.ends_with(b"u")
+                        && matches!(ie, InternalEvent::Event(Event::Key(_)))
+                    {
+                        self.reported_keyboard_enhancement = true;
+                        self.internal_events
+                            .push_back(InternalEvent::KeyboardEnhancementDetected);
+                    }
                     self.internal_events.push_back(ie);
                     self.buffer.clear();
                 }

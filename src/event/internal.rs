@@ -75,6 +75,9 @@ pub(crate) enum InternalEvent {
     /// The progressive keyboard enhancement flags enabled by the terminal.
     #[cfg(unix)]
     KeyboardEnhancementFlags(KeyboardEnhancementFlags),
+    /// A successfully decoded CSI-u key proves keyboard enhancement is already active.
+    #[cfg(unix)]
+    KeyboardEnhancementDetected,
     /// Attributes and architectural class of the terminal.
     #[cfg(unix)]
     PrimaryDeviceAttributes,
@@ -87,12 +90,19 @@ pub(crate) enum InternalEvent {
 }
 
 impl InternalEvent {
+    /// Replay input and its encoding evidence, but not query replies already read by the caller.
+    #[cfg(unix)]
+    pub(crate) fn is_replayed_input(&self) -> bool {
+        matches!(self, Self::Event(_) | Self::KeyboardEnhancementDetected)
+    }
+
     /// Keep capability replies and palette boundaries when an application quarantines user input.
     #[cfg(unix)]
     pub(crate) fn is_terminal_response(&self) -> bool {
         matches!(
             self,
             Self::KeyboardEnhancementFlags(_)
+                | Self::KeyboardEnhancementDetected
                 | Self::OscColor { .. }
                 | Self::OperatingStatus
                 | Self::ColorSchemeChanged

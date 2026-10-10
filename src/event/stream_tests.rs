@@ -28,5 +28,8 @@ fn terminal_stream_includes_palette_replies_without_changing_input_streams() {
     assert!(StreamFilter::Terminal.eval(&keyboard));
     // Draining a palette boundary must leave a pending keyboard reply for the stream.
     assert!(!StreamFilter::Responses.eval(&keyboard));
+    assert!(!StreamFilter::Input.eval(&InternalEvent::KeyboardEnhancementDetected));
+    assert!(StreamFilter::Terminal.eval(&InternalEvent::KeyboardEnhancementDetected));
+    assert!(!StreamFilter::Responses.eval(&InternalEvent::KeyboardEnhancementDetected));
     assert!(!StreamFilter::Terminal.eval(&InternalEvent::CursorPosition(1, 2)));
 }
