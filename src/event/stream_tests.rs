@@ -1,5 +1,5 @@
 use super::*;
-use crate::event::{KeyCode, internal::OscColorPayload};
+use crate::event::{KeyCode, KeyboardEnhancementFlags, internal::OscColorPayload};
 
 #[test]
 fn terminal_stream_includes_palette_replies_without_changing_input_streams() {
@@ -21,5 +21,12 @@ fn terminal_stream_includes_palette_replies_without_changing_input_streams() {
         assert!(!StreamFilter::Input.eval(&event));
         assert!(StreamFilter::Terminal.eval(&event));
     }
+    let keyboard = InternalEvent::KeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+    );
+    assert!(!StreamFilter::Input.eval(&keyboard));
+    assert!(StreamFilter::Terminal.eval(&keyboard));
+    // Draining a palette boundary must leave a pending keyboard reply for the stream.
+    assert!(!StreamFilter::Responses.eval(&keyboard));
     assert!(!StreamFilter::Terminal.eval(&InternalEvent::CursorPosition(1, 2)));
 }

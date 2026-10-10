@@ -163,6 +163,12 @@ enum StreamFilter {
 
 impl Filter for StreamFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
+        #[cfg(unix)]
+        if matches!(self, Self::Terminal)
+            && matches!(event, InternalEvent::KeyboardEnhancementFlags(_))
+        {
+            return true;
+        }
         if matches!(self, Self::Terminal | Self::Responses)
             && matches!(
                 event,
@@ -177,11 +183,14 @@ impl Filter for StreamFilter {
     }
 }
 
-/// Input and terminal palette responses delivered by [`TerminalEventStream`].
+/// Input and terminal capability responses delivered by [`TerminalEventStream`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
     /// Ordinary keyboard, paste, mouse, focus, or resize input.
     Input(Event),
+    /// Reply to a progressive keyboard enhancement query (`CSI ? u`).
+    #[cfg(unix)]
+    KeyboardEnhancementFlags(super::KeyboardEnhancementFlags),
     /// An OSC color response. An unrecognized color is reported as `None`.
     Color {
         slot: u8,
@@ -193,11 +202,11 @@ pub enum TerminalEvent {
     OperatingStatus,
 }
 
-/// An opt-in event stream that delivers OSC color replies and DEC mode 2031 notifications.
+/// An opt-in event stream that delivers terminal capability replies and color notifications.
 ///
-/// Uses the same single input reader as [`EventStream`]. Applications can write color queries
+/// Uses the same single input reader as [`EventStream`]. Applications can write terminal queries
 /// without waiting for a reply or blocking keyboard input. Do not use this concurrently with
-/// another event reader or the synchronous color-query helpers. Notifications must be enabled
+/// another event reader or the synchronous query helpers. Notifications must be enabled
 /// separately by the application; this stream does not change terminal modes.
 #[derive(Debug)]
 pub struct TerminalEventStream(EventStream);
@@ -216,6 +225,10 @@ impl Stream for TerminalEventStream {
             event.map(|event| {
                 event.map(|event| match event {
                     InternalEvent::Event(event) => TerminalEvent::Input(event),
+                    #[cfg(unix)]
+                    InternalEvent::KeyboardEnhancementFlags(flags) => {
+                        TerminalEvent::KeyboardEnhancementFlags(flags)
+                    }
                     InternalEvent::OscColor { slot, payload } => TerminalEvent::Color {
                         slot,
                         color: match payload {

@@ -54,9 +54,9 @@ impl InternalEventReader {
             .as_mut()
             .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
         let status = source.discard_buffered_input();
-        self.events.retain(InternalEvent::is_palette_response);
+        self.events.retain(InternalEvent::is_terminal_response);
         self.skipped_events
-            .retain(InternalEvent::is_palette_response);
+            .retain(InternalEvent::is_terminal_response);
         Ok(status)
     }
 
@@ -323,11 +323,15 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_discard_buffered_input_clears_input_and_retains_palette_boundaries() {
+    fn test_discard_buffered_input_clears_input_and_retains_terminal_responses() {
+        let keyboard_reply = InternalEvent::KeyboardEnhancementFlags(
+            crate::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        );
         let mut reader = InternalEventReader {
             events: VecDeque::from([
                 InternalEvent::Event(Event::Resize(10, 10)),
                 InternalEvent::OperatingStatus,
+                keyboard_reply.clone(),
             ]),
             source: Some(Box::new(FakeSource::with_events(&[InternalEvent::Event(
                 Event::Resize(20, 20),
@@ -335,6 +339,7 @@ mod tests {
             skipped_events: vec![
                 InternalEvent::CursorPosition(4, 8),
                 InternalEvent::ColorSchemeChanged,
+                keyboard_reply.clone(),
             ],
         };
 
@@ -343,8 +348,14 @@ mod tests {
             super::InputDiscardStatus::Complete
         );
 
-        assert_eq!(reader.events, [InternalEvent::OperatingStatus]);
-        assert_eq!(reader.skipped_events, [InternalEvent::ColorSchemeChanged]);
+        assert_eq!(
+            reader.events,
+            [InternalEvent::OperatingStatus, keyboard_reply.clone()]
+        );
+        assert_eq!(
+            reader.skipped_events,
+            [InternalEvent::ColorSchemeChanged, keyboard_reply]
+        );
         assert_eq!(
             reader
                 .source

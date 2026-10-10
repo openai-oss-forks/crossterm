@@ -87,12 +87,15 @@ pub(crate) enum InternalEvent {
 }
 
 impl InternalEvent {
-    /// Keep palette generations framed when an application quarantines user input.
+    /// Keep capability replies and palette boundaries when an application quarantines user input.
     #[cfg(unix)]
-    pub(crate) fn is_palette_response(&self) -> bool {
+    pub(crate) fn is_terminal_response(&self) -> bool {
         matches!(
             self,
-            Self::OscColor { .. } | Self::OperatingStatus | Self::ColorSchemeChanged
+            Self::KeyboardEnhancementFlags(_)
+                | Self::OscColor { .. }
+                | Self::OperatingStatus
+                | Self::ColorSchemeChanged
         )
     }
 }

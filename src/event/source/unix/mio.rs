@@ -276,7 +276,7 @@ impl Parser {
         }
         self.buffer.clear();
         self.internal_events
-            .retain(InternalEvent::is_palette_response);
+            .retain(InternalEvent::is_terminal_response);
         self.pending_escape_deadline = None;
         match self.discarded_sequence {
             Some(DiscardedSequence::PasteStart(_) | DiscardedSequence::PasteBody(_)) => {
@@ -459,6 +459,10 @@ mod secondary_device_attributes_tests;
 #[cfg(test)]
 #[path = "../discarded_status_tests.rs"]
 mod discarded_status_tests;
+
+#[cfg(test)]
+#[path = "../startup_reply_tests.rs"]
+mod startup_reply_tests;
 
 #[cfg(test)]
 mod tests {

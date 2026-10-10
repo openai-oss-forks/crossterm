@@ -266,7 +266,7 @@ pub enum InputDiscardStatus {
     ControlSequenceInProgress,
 }
 
-/// Discard decoded input while preserving palette replies and incomplete escape boundaries.
+/// Discard decoded input while preserving terminal replies and incomplete escape boundaries.
 ///
 /// This does not flush the operating system's terminal input queue. Callers that need a clean
 /// input boundary should drain it through the event reader. If an incomplete bracketed paste or
