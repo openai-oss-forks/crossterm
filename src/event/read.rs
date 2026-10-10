@@ -66,6 +66,41 @@ impl InternalEventReader {
         self.source.as_ref().expect("reader source not set").waker()
     }
 
+    /// Discard matching events already available without waiting for new input.
+    ///
+    /// Drain the source directly: a zero-duration filtered poll stops after an unrelated event
+    /// and can leave a stale matching response behind it. Retain other events in their original
+    /// order, including events skipped by an earlier interrupted poll.
+    #[cfg(unix)]
+    pub(crate) fn discard_available<F>(
+        &mut self,
+        filter: &F,
+        timeout: &PollTimeout,
+    ) -> io::Result<()>
+    where
+        F: Filter,
+    {
+        self.events.retain(|event| !filter.eval(event));
+        self.events.extend(
+            self.skipped_events
+                .drain(..)
+                .filter(|event| !filter.eval(event)),
+        );
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
+        while !timeout.elapsed() {
+            let Some(event) = source.try_read(Some(Duration::ZERO))? else {
+                break;
+            };
+            if !filter.eval(&event) {
+                self.events.push_back(event);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn poll<F>(&mut self, timeout: Option<Duration>, filter: &F) -> io::Result<bool>
     where
         F: Filter,
@@ -312,6 +347,48 @@ mod tests {
             reader.try_read(&InternalEventFilter).unwrap(),
             SKIPPED_EVENT
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discard_available_removes_stale_cursor_replies_after_unrelated_input() {
+        let old_position = InternalEvent::CursorPosition(3, 2);
+        let fresh_position = InternalEvent::CursorPosition(11, 7);
+        let input = InternalEvent::Event(Event::Key(crate::event::KeyCode::Char('a').into()));
+        let mut reader = InternalEventReader {
+            events: VecDeque::from([old_position.clone(), input.clone()]),
+            skipped_events: vec![InternalEvent::OperatingStatus, old_position.clone()],
+            source: Some(Box::new(FakeSource::with_events(&[
+                input.clone(),
+                old_position,
+                InternalEvent::KeyboardEnhancementDetected,
+            ]))),
+        };
+        let retained = VecDeque::from([
+            input.clone(),
+            InternalEvent::OperatingStatus,
+            input,
+            InternalEvent::KeyboardEnhancementDetected,
+        ]);
+
+        reader
+            .discard_available(
+                &CursorPositionFilter,
+                &super::PollTimeout::new(Some(Duration::from_secs(1))),
+            )
+            .unwrap();
+        assert_eq!(reader.events, retained);
+        assert!(reader.skipped_events.is_empty());
+
+        // A fresh request can now accept only its new reply, while all other input stays queued.
+        reader.source = Some(Box::new(FakeSource::with_events(&[fresh_position.clone()])));
+        assert!(
+            reader
+                .poll(Some(Duration::ZERO), &CursorPositionFilter)
+                .unwrap()
+        );
+        assert_eq!(reader.try_read(&CursorPositionFilter), Some(fresh_position));
+        assert_eq!(reader.events, retained);
     }
 
     #[test]

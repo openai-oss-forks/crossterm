@@ -45,9 +45,7 @@ pub fn position_with_timeout(timeout: Duration) -> io::Result<(u16, u16)> {
         let timed_out = || Error::new(io::ErrorKind::TimedOut, "cursor position query timed out");
         let mut reader = internal::try_lock_event_reader_for(timeout.leftover().unwrap())
             .ok_or_else(timed_out)?;
-        while !timeout.elapsed() && reader.poll(Some(Duration::ZERO), &CursorPositionFilter)? {
-            let _ = reader.try_read(&CursorPositionFilter);
-        }
+        reader.discard_available(&CursorPositionFilter, &timeout)?;
         if timeout.elapsed() {
             return Err(timed_out());
         }
