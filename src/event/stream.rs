@@ -53,7 +53,9 @@ impl EventStream {
         thread::spawn(move || {
             while let Ok(task) = receiver.recv() {
                 loop {
-                    if let Ok(true) = internal::poll(None, &filter) {
+                    if let Ok(true) =
+                        internal::poll_event_stream(&filter, &task.stream_wake_task_should_shutdown)
+                    {
                         break;
                     }
 

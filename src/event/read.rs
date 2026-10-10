@@ -91,8 +91,11 @@ impl InternalEventReader {
             .as_mut()
             .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
         while !timeout.elapsed() {
-            let Some(event) = source.try_read(Some(Duration::ZERO))? else {
-                break;
+            let event = match source.try_read(Some(Duration::ZERO)) {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             };
             if !filter.eval(&event) {
                 self.events.push_back(event);
@@ -358,11 +361,14 @@ mod tests {
         let mut reader = InternalEventReader {
             events: VecDeque::from([old_position.clone(), input.clone()]),
             skipped_events: vec![InternalEvent::OperatingStatus, old_position.clone()],
-            source: Some(Box::new(FakeSource::with_events(&[
-                input.clone(),
-                old_position,
-                InternalEvent::KeyboardEnhancementDetected,
-            ]))),
+            source: Some(Box::new(FakeSource {
+                events: VecDeque::from([
+                    input.clone(),
+                    old_position,
+                    InternalEvent::KeyboardEnhancementDetected,
+                ]),
+                error: Some(io::Error::new(io::ErrorKind::Interrupted, "reader paused")),
+            })),
         };
         let retained = VecDeque::from([
             input.clone(),

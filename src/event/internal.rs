@@ -43,6 +43,24 @@ where
     reader.poll(timeout, filter)
 }
 
+/// Check cancellation after acquiring the reader so a dropped stream cannot start another poll.
+/// A different input owner may have consumed the wake notification while this task waited for
+/// the lock; once the lock is held, a later cancellation wake can only reach this poll.
+#[cfg(feature = "event-stream")]
+pub(crate) fn poll_event_stream<F>(
+    filter: &F,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<bool>
+where
+    F: Filter,
+{
+    let mut reader = lock_event_reader();
+    if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(false);
+    }
+    reader.poll(None, filter)
+}
+
 /// Reads a single `InternalEvent`.
 pub(crate) fn read<F>(filter: &F) -> std::io::Result<InternalEvent>
 where

@@ -39,6 +39,8 @@ pub(crate) struct UnixInternalEventSource {
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
+    #[cfg(feature = "event-stream")]
+    wake_consumed: bool,
 }
 
 impl UnixInternalEventSource {
@@ -70,6 +72,8 @@ impl UnixInternalEventSource {
             signals,
             #[cfg(feature = "event-stream")]
             waker,
+            #[cfg(feature = "event-stream")]
+            wake_consumed: false,
         })
     }
 }
@@ -82,9 +86,8 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if self.pending_tty_readable {
-                self.pending_tty_readable = false;
-            } else {
+            let resuming_tty = std::mem::take(&mut self.pending_tty_readable);
+            if !resuming_tty {
                 let poll_timeout = self.parser.poll_timeout(timeout.leftover());
                 if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
                     // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
@@ -96,6 +99,10 @@ impl EventSource for UnixInternalEventSource {
                         return Err(e);
                     }
                 }
+                #[cfg(feature = "event-stream")]
+                {
+                    self.wake_consumed = false;
+                }
 
                 if self.events.is_empty() {
                     // No readiness events = timeout
@@ -103,7 +110,7 @@ impl EventSource for UnixInternalEventSource {
                 }
             }
 
-            for token in self.events.iter().map(|x| x.token()) {
+            for token in self.events.iter().map(|event| event.token()) {
                 match token {
                     TTY_TOKEN => {
                         loop {
@@ -159,7 +166,18 @@ impl EventSource for UnixInternalEventSource {
                         }
                     }
                     #[cfg(feature = "event-stream")]
+                    WAKE_TOKEN if self.wake_consumed => {}
+                    #[cfg(feature = "event-stream")]
                     WAKE_TOKEN => {
+                        // Returning here must not lose a later TTY readiness edge in this batch.
+                        // Resume that batch on the next read, skipping this consumed wake token.
+                        self.wake_consumed = true;
+                        self.pending_tty_readable = self
+                            .events
+                            .iter()
+                            .skip_while(|event| event.token() != WAKE_TOKEN)
+                            .skip(1)
+                            .any(|event| event.token() == TTY_TOKEN);
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
                             "Poll operation was woken up by `Waker::wake`",
@@ -495,6 +513,36 @@ mod tests {
             UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
             writer,
         )
+    }
+
+    #[cfg(feature = "event-stream")]
+    #[test]
+    fn reader_wakeup_preserves_ready_quarantined_input() {
+        let (mut source, mut writer) = source_with_input();
+        source.parser.buffer_external_input(b"\x1b[?");
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::ControlSequenceInProgress,
+        );
+        source.waker().wake().unwrap();
+        writer.write_all(b"7un").unwrap();
+
+        loop {
+            match source.try_read(Some(Duration::ZERO)) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => {
+                    assert_eq!(
+                        result.unwrap(),
+                        Some(InternalEvent::Event(Event::Key(KeyCode::Char('n').into()))),
+                    );
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            source.discard_buffered_input(),
+            InputDiscardStatus::Complete
+        );
     }
 
     #[test]

@@ -33,3 +33,32 @@ fn terminal_stream_includes_palette_replies_without_changing_input_streams() {
     assert!(!StreamFilter::Responses.eval(&InternalEvent::KeyboardEnhancementDetected));
     assert!(!StreamFilter::Terminal.eval(&InternalEvent::CursorPosition(1, 2)));
 }
+
+#[test]
+fn canceled_stream_does_not_poll_after_waiting_for_the_reader() {
+    let reader = internal::lock_event_reader();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = shutdown.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        result_tx
+            .send(internal::poll_event_stream(
+                &StreamFilter::Terminal,
+                &worker_shutdown,
+            ))
+            .unwrap();
+    });
+    ready_rx.recv().unwrap();
+    shutdown.store(true, Ordering::SeqCst);
+    // Cancellation remains visible even if a different reader has already consumed its wakeup.
+    drop(reader);
+    assert!(
+        !result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+    );
+    worker.join().unwrap();
+}
