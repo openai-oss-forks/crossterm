@@ -216,6 +216,7 @@ enum DiscardedSequence {
     OscBody,
     OscEscape,
     Csi,
+    OperatingStatus,
     X10Mouse(usize),
     Ss3,
 }
@@ -265,6 +266,8 @@ impl Parser {
                 });
             } else if self.buffer.starts_with(b"\x1b[M") {
                 self.discarded_sequence = Some(DiscardedSequence::X10Mouse(6 - self.buffer.len()));
+            } else if self.buffer == b"\x1b[0" {
+                self.discarded_sequence = Some(DiscardedSequence::OperatingStatus);
             } else if self.buffer.starts_with(b"\x1b[") {
                 self.discarded_sequence = Some(DiscardedSequence::Csi);
             } else if self.buffer.starts_with(b"\x1bO") {
@@ -339,6 +342,9 @@ impl Parser {
                     DiscardedSequence::PasteStart(2) if *byte == b'[' => {
                         Some(DiscardedSequence::Csi)
                     }
+                    DiscardedSequence::PasteStart(2) if *byte == b'0' => {
+                        Some(DiscardedSequence::OperatingStatus)
+                    }
                     DiscardedSequence::PasteStart(matched)
                         if matched >= 2 && !(0x40..=0x7e).contains(byte) =>
                     {
@@ -372,15 +378,29 @@ impl Parser {
                     DiscardedSequence::OscBody | DiscardedSequence::OscEscape => {
                         Some(DiscardedSequence::OscBody)
                     }
-                    DiscardedSequence::Csi | DiscardedSequence::Ss3 if *byte == b'\x1b' => {
+                    DiscardedSequence::OperatingStatus if *byte == b'n' => {
+                        // Preserve the protocol boundary without releasing quarantined input.
+                        self.internal_events
+                            .push_back(InternalEvent::OperatingStatus);
+                        None
+                    }
+                    DiscardedSequence::Csi
+                    | DiscardedSequence::OperatingStatus
+                    | DiscardedSequence::Ss3
+                        if *byte == b'\x1b' =>
+                    {
                         Some(DiscardedSequence::PasteStart(1))
                     }
-                    DiscardedSequence::Csi | DiscardedSequence::Ss3
+                    DiscardedSequence::Csi
+                    | DiscardedSequence::OperatingStatus
+                    | DiscardedSequence::Ss3
                         if (0x40..=0x7e).contains(byte) =>
                     {
                         None
                     }
-                    DiscardedSequence::Csi => Some(DiscardedSequence::Csi),
+                    DiscardedSequence::Csi | DiscardedSequence::OperatingStatus => {
+                        Some(DiscardedSequence::Csi)
+                    }
                     DiscardedSequence::X10Mouse(remaining) if remaining > 1 => {
                         Some(DiscardedSequence::X10Mouse(remaining - 1))
                     }
@@ -435,6 +455,10 @@ impl Iterator for Parser {
 #[cfg(test)]
 #[path = "../secondary_device_attributes_tests.rs"]
 mod secondary_device_attributes_tests;
+
+#[cfg(test)]
+#[path = "../discarded_status_tests.rs"]
+mod discarded_status_tests;
 
 #[cfg(test)]
 mod tests {
