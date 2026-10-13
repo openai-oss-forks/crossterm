@@ -5,8 +5,8 @@ use crate::event::{
     MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use crate::event::internal::{InternalEvent, OscColorPayload};
-use crate::style::Color;
+use crate::event::internal::InternalEvent;
+use crate::event::terminal_response::parse_osc;
 
 // Event parsing
 //
@@ -22,55 +22,6 @@ use crate::style::Color;
 
 fn could_not_parse_event_error() -> io::Error {
     io::Error::other("Could not parse an event.")
-}
-
-fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
-    debug_assert!(buffer.starts_with(b"\x1B]"));
-
-    let Some(content_end) = osc_payload_end(buffer) else {
-        return Ok(None);
-    };
-
-    let text = String::from_utf8_lossy(&buffer[2..content_end]);
-    let mut parts = text.splitn(2, ';');
-
-    let slot = match parts.next().unwrap_or("").parse::<u16>() {
-        Ok(value) if value <= u8::MAX as u16 => value as u8,
-        _ => return Ok(None),
-    };
-
-    if slot != 10 && slot != 11 {
-        return Ok(None);
-    }
-
-    let payload_str = parts.next().unwrap_or("");
-    let payload = match Color::from_osc_rgb(payload_str) {
-        Some(Color::Rgb { r, g, b }) => OscColorPayload::Rgb { r, g, b },
-        Some(_) => unreachable!("Color::from_osc_rgb returned non-RGB variant"),
-        None => OscColorPayload::Unrecognized(payload_str.to_string()),
-    };
-
-    Ok(Some(InternalEvent::OscColor { slot, payload }))
-}
-
-fn osc_payload_end(buffer: &[u8]) -> Option<usize> {
-    let mut idx = 2;
-    while idx < buffer.len() {
-        match buffer[idx] {
-            0x07 => return Some(idx),
-            0x1B => {
-                if idx + 1 >= buffer.len() {
-                    return None;
-                }
-                if buffer[idx + 1] == b'\\' {
-                    return Some(idx);
-                }
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-    None
 }
 
 pub(crate) fn parse_event(
@@ -232,6 +183,9 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         // parser consumes completed, unhandled CSI replies without producing keys.
         b'>' => None,
         b'?' => match buffer[buffer.len() - 1] {
+            b'n' if matches!(buffer, b"\x1b[?997;1n" | b"\x1b[?997;2n") => {
+                return Ok(Some(InternalEvent::ColorSchemeChanged));
+            }
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
             _ => None,
@@ -252,6 +206,9 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
                         return parse_csi_bracketed_paste(buffer);
                     }
                     match last_byte {
+                        b'n' if buffer == b"\x1b[0n" => {
+                            return Ok(Some(InternalEvent::OperatingStatus));
+                        }
                         b'M' => return parse_csi_rxvt_mouse(buffer),
                         b'~' => return parse_csi_special_key_code(buffer),
                         b'u' => return parse_csi_u_encoded_key_code(buffer),
@@ -918,6 +875,7 @@ pub(crate) fn parse_utf8_char(buffer: &[u8]) -> io::Result<Option<char>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::event::internal::OscColorPayload;
     use crate::event::{KeyEventState, KeyModifiers, MouseButton, MouseEvent};
 
     use super::*;
@@ -1132,6 +1090,15 @@ mod tests {
             parse_csi(b"\x1B[O").unwrap(),
             Some(InternalEvent::Event(Event::FocusLost))
         );
+        for notification in [b"\x1b[?997;1n", b"\x1b[?997;2n"] {
+            for end in 2..notification.len() {
+                assert_eq!(parse_csi(&notification[..end]).unwrap(), None);
+            }
+            assert_eq!(
+                parse_csi(notification).unwrap(),
+                Some(InternalEvent::ColorSchemeChanged)
+            );
+        }
     }
 
     #[test]

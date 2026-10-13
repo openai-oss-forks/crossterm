@@ -79,12 +79,25 @@ pub(crate) enum InternalEvent {
     #[cfg(unix)]
     PrimaryDeviceAttributes,
     /// OSC color response (`slot`, `payload`).
-    #[cfg(unix)]
     OscColor { slot: u8, payload: OscColorPayload },
+    /// Successful operating-status reply (DSR 5).
+    OperatingStatus,
+    /// A DEC mode 2031 palette-change notification.
+    ColorSchemeChanged,
+}
+
+impl InternalEvent {
+    /// Keep palette generations framed when an application quarantines user input.
+    #[cfg(unix)]
+    pub(crate) fn is_palette_response(&self) -> bool {
+        matches!(
+            self,
+            Self::OscColor { .. } | Self::OperatingStatus | Self::ColorSchemeChanged
+        )
+    }
 }
 
 /// Parsed payload of an OSC color response.
-#[cfg(unix)]
 #[derive(Debug, PartialOrd, PartialEq, Hash, Clone, Eq)]
 pub(crate) enum OscColorPayload {
     /// Parsed RGB values (always 8-bit per channel).
