@@ -26,6 +26,11 @@ const WAKE_TOKEN: Token = Token(2);
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
 const BUFFERED_ESCAPE_TIMEOUT: Duration = Duration::from_millis(20);
+// A read boundary is not a key boundary. Allow terminal reports split by a
+// scheduler, PTY, or remote connection to finish before emitting a bare Esc.
+// Enhanced-keyboard Esc sequences remain immediate; legacy Esc waits at most
+// this ambiguity window, unless the caller asks to poll again later.
+const TTY_ESCAPE_TIMEOUT: Duration = Duration::from_millis(200);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -110,9 +115,9 @@ impl EventSource for UnixInternalEventSource {
                             match self.tty_fd.read(&mut self.tty_buffer) {
                                 Ok(read_count) => {
                                     if read_count > 0 {
-                                        self.parser.advance(
+                                        self.parser.buffer_input(
                                             &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
+                                            TTY_ESCAPE_TIMEOUT,
                                         );
                                     }
                                 }
@@ -284,9 +289,13 @@ impl Parser {
     }
 
     fn buffer_external_input(&mut self, buffer: &[u8]) {
+        self.buffer_input(buffer, BUFFERED_ESCAPE_TIMEOUT);
+    }
+
+    fn buffer_input(&mut self, buffer: &[u8], escape_timeout: Duration) {
         self.advance(buffer, true);
         if self.buffer.as_slice() == b"\x1b" {
-            self.pending_escape_deadline = Some(Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
+            self.pending_escape_deadline = Some(Instant::now() + escape_timeout);
         }
     }
 

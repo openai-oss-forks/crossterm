@@ -23,6 +23,15 @@
 //! [`EnableMouseCapture`](struct.EnableMouseCapture.html) / [`EnableFocusChange`](struct.EnableFocusChange.html) command.
 //! See [Command API](../index.html#command-api) for more information.
 //!
+//! ## Escape ambiguity on Unix
+//!
+//! The default Mio input source retains a lone ESC for up to 200 ms so that
+//! terminal reports split across reads are not mistaken for the Escape key.
+//! A shorter [`poll`] timeout may return `false` while that prefix is pending.
+//! Complete enhanced-keyboard Escape sequences and Ctrl+C do not wait for this
+//! ambiguity window. Once the window expires without a continuation, the input
+//! is reported as a legacy Escape key; a later suffix cannot be reassembled.
+//!
 //! ## Examples
 //!
 //! Blocking read:
