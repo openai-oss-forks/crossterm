@@ -23,6 +23,39 @@
 //! [`EnableMouseCapture`](struct.EnableMouseCapture.html) / [`EnableFocusChange`](struct.EnableFocusChange.html) command.
 //! See [Command API](../index.html#command-api) for more information.
 //!
+//! ## Escape ambiguity on Unix
+//!
+//! The default Mio input source retains a lone ESC for up to 200 ms so that
+//! terminal reports split across reads are not mistaken for the Escape key.
+//! A shorter [`poll`](crate::event::poll) timeout may return `false` while that prefix is pending.
+//! Complete enhanced-keyboard Escape sequences and standalone Ctrl+C are immediate.
+//! A CSI, OSC or SS3 prefix assembled from a timed ESC retains its original deadline.
+//! Complete reports in the current TTY read are parsed or consumed before expiry.
+//! Reads hold at most 1024 bytes, so late larger reports may not reassemble.
+//! An incomplete prefix expires even while input arrives; retained bytes become
+//! Escape keys and normal input without starting another control-sequence wait.
+//! Invalid CSI/SS3 continuations in the C0, DEL or non-ASCII ranges are processed
+//! independently. Complete unsupported or parser-rejected sequences retain their
+//! existing consumption policy even after expiry; they are not replayed as keys.
+//! Ctrl+C can also end an expired control prefix independently; inside an OSC's
+//! ambiguity window, C0 bytes retain the existing OSC content policy.
+//! A suffix cannot be reassembled after its prefix expires. Malformed UTF-8 keeps
+//! its normal decoding/error policy.
+//! Legacy encoding cannot distinguish Esc followed quickly by a character from
+//! an Alt-modified key. Those bytes may combine within the ambiguity window;
+//! enhanced keyboard encoding avoids that ambiguity. Discarding a pending TTY
+//! Esc and its incomplete control prefix resolve after the same window without
+//! emitting discarded bytes or absorbing a subsequent independent Ctrl+C.
+//! Complete readable suffixes within the current read are consumed before expiry.
+//! A fresh ESC after a discarded bare ESC starts a new report; inside a discarded
+//! OSC it is treated as a possible string terminator. Delayed independent `[`, `]`
+//! or `O` bytes cannot always be distinguished from continuations and may be discarded.
+//! No finite window can distinguish all arbitrarily delayed legacy input.
+//! Confirmed bracketed-paste bodies keep their existing framing for arbitrary
+//! lengths and delays; paste contents never use this fallback. Externally
+//! buffered input retains its separate 20 ms bare ESC and discard-quarantine
+//! contract. Adding external input to a pending TTY prefix hands it to that policy.
+//!
 //! ## Examples
 //!
 //! Blocking read:
