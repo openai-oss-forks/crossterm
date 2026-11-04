@@ -28,17 +28,28 @@
 //! The default Mio input source retains a lone ESC for up to 200 ms so that
 //! terminal reports split across reads are not mistaken for the Escape key.
 //! A shorter [`poll`](crate::event::poll) timeout may return `false` while that prefix is pending.
-//! Complete enhanced-keyboard Escape sequences and Ctrl+C do not wait for this
-//! ambiguity window. Once the window expires without a continuation, the input
-//! is reported as a legacy Escape key; a later suffix cannot be reassembled.
+//! Complete enhanced-keyboard Escape sequences and standalone Ctrl+C do not wait
+//! for this ambiguity window. A CSI, OSC or SS3 prefix assembled from that ESC
+//! retains its original deadline. A complete readable report takes precedence
+//! over expiry; an incomplete prefix expires even while more input arrives.
+//! Retained bytes then become a legacy Escape key followed by normal input,
+//! with any embedded ESC bytes also resolved as Escape keys. This fallback
+//! cannot start another control-sequence wait. Invalid CSI/SS3 continuations
+//! such as Ctrl+C are processed independently rather than lost with the prefix.
+//! A later suffix cannot be reassembled after the prefix has expired.
 //! Legacy encoding cannot distinguish Esc followed quickly by a character from
 //! an Alt-modified key. Those bytes may combine within the ambiguity window;
 //! enhanced keyboard encoding avoids that ambiguity. Discarding a pending TTY
-//! Esc resolves on an empty poll after the same window, without emitting the
-//! discarded key. While that discard is pending, readable CSI, OSC and SS3
+//! Esc and its incomplete control prefix resolve after the same window without
+//! emitting discarded bytes or absorbing a subsequent independent Ctrl+C.
+//! While that discard is pending, readable CSI, OSC and SS3
 //! continuations take precedence over an elapsed deadline; a fresh ESC starts
 //! a new report. A delayed independent `[`, `]` or `O` cannot be distinguished
 //! from those continuations and may be discarded with them.
+//! No finite window can distinguish all arbitrarily delayed legacy input.
+//! Confirmed bracketed-paste bodies keep their existing framing for arbitrary
+//! lengths and delays; paste contents never use this fallback. Externally
+//! buffered input retains its separate 20 ms ESC and discard-quarantine contract.
 //!
 //! ## Examples
 //!
