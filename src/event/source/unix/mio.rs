@@ -606,6 +606,10 @@ mod discarded_tty_tests;
 mod prefix_lifecycle_tests;
 
 #[cfg(test)]
+#[path = "osc_completion_tests.rs"]
+mod osc_completion_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Parser, UnixInternalEventSource};
     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
