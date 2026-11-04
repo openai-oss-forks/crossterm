@@ -282,6 +282,7 @@ impl Parser {
         self.buffer.clear();
         self.internal_events.clear();
         if !timed_escape
+            || self.discarded_sequence.is_none()
             || matches!(
                 self.discarded_sequence,
                 Some(DiscardedSequence::PasteBody(_))
@@ -558,6 +559,14 @@ impl Parser {
                         self.pending_escape_deadline = None;
                         self.timed_tty_escape = false;
                     }
+                }
+                Err(_)
+                    if self.timed_tty_escape
+                        && self
+                            .pending_escape_deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline) =>
+                {
+                    self.resolve_tty_prefix();
                 }
                 Err(_) => {
                     // Event can't be parsed (not enough parameters, parameter is not a number, ...).

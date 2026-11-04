@@ -28,28 +28,32 @@
 //! The default Mio input source retains a lone ESC for up to 200 ms so that
 //! terminal reports split across reads are not mistaken for the Escape key.
 //! A shorter [`poll`](crate::event::poll) timeout may return `false` while that prefix is pending.
-//! Complete enhanced-keyboard Escape sequences and standalone Ctrl+C do not wait
-//! for this ambiguity window. A CSI, OSC or SS3 prefix assembled from that ESC
-//! retains its original deadline. A complete readable report takes precedence
-//! over expiry; an incomplete prefix expires even while more input arrives.
-//! Retained bytes then become a legacy Escape key followed by normal input,
-//! with any embedded ESC bytes also resolved as Escape keys. This fallback
-//! cannot start another control-sequence wait. Invalid CSI/SS3 continuations
-//! such as Ctrl+C are processed independently rather than lost with the prefix.
-//! A later suffix cannot be reassembled after the prefix has expired.
+//! Complete enhanced-keyboard Escape sequences and standalone Ctrl+C are immediate.
+//! A CSI, OSC or SS3 prefix assembled from a timed ESC retains its original deadline.
+//! A report completed in the current TTY read takes precedence over expiry. Reads
+//! hold at most 1024 bytes, so late larger reports are not guaranteed to reassemble.
+//! An incomplete prefix expires even while input arrives; retained bytes become
+//! Escape keys and normal input without starting another control-sequence wait.
+//! Invalid CSI/SS3 continuations in the C0, DEL or non-ASCII ranges are processed
+//! independently. Other parse errors retain their existing policy until expiry.
+//! Ctrl+C can also end an expired control prefix independently; inside an OSC's
+//! ambiguity window, C0 bytes retain the existing OSC content policy.
+//! A suffix cannot be reassembled after its prefix expires. Malformed UTF-8 keeps
+//! its normal decoding/error policy.
 //! Legacy encoding cannot distinguish Esc followed quickly by a character from
 //! an Alt-modified key. Those bytes may combine within the ambiguity window;
 //! enhanced keyboard encoding avoids that ambiguity. Discarding a pending TTY
 //! Esc and its incomplete control prefix resolve after the same window without
 //! emitting discarded bytes or absorbing a subsequent independent Ctrl+C.
-//! While that discard is pending, readable CSI, OSC and SS3
-//! continuations take precedence over an elapsed deadline; a fresh ESC starts
-//! a new report. A delayed independent `[`, `]` or `O` cannot be distinguished
-//! from those continuations and may be discarded with them.
+//! Complete readable suffixes within the current read are consumed before expiry.
+//! A fresh ESC after a discarded bare ESC starts a new report; inside a discarded
+//! OSC it is treated as a possible string terminator. Delayed independent `[`, `]`
+//! or `O` bytes cannot always be distinguished from continuations and may be discarded.
 //! No finite window can distinguish all arbitrarily delayed legacy input.
 //! Confirmed bracketed-paste bodies keep their existing framing for arbitrary
 //! lengths and delays; paste contents never use this fallback. Externally
-//! buffered input retains its separate 20 ms ESC and discard-quarantine contract.
+//! buffered input retains its separate 20 ms bare ESC and discard-quarantine
+//! contract. Adding external input to a pending TTY prefix hands it to that policy.
 //!
 //! ## Examples
 //!
