@@ -416,6 +416,7 @@ impl Parser {
                             self.discarded_sequence,
                             Some(DiscardedSequence::OscBody | DiscardedSequence::OscEscape)
                         ))
+                    && *byte < 0x20
                     && *byte != b'\x07'
                     && *byte != b'\x1b';
                 if invalid_control && (csi_or_ss3 || expired_osc) {
