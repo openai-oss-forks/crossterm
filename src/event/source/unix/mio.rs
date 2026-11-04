@@ -509,6 +509,10 @@ mod fragmented_input_tests;
 mod escape_lifecycle_tests;
 
 #[cfg(test)]
+#[path = "discarded_tty_tests.rs"]
+mod discarded_tty_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Parser, UnixInternalEventSource};
     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
