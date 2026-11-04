@@ -349,10 +349,28 @@ impl Parser {
         if buffer.is_empty() {
             return;
         }
-        if self.timed_tty_escape && self.discarded_sequence.is_some() {
-            // A new independent key after the discarded TTY ESC's deadline
-            // must not be swallowed as its continuation.
-            self.finish_pending_escape();
+        if self.timed_tty_escape
+            && matches!(
+                self.discarded_sequence,
+                Some(DiscardedSequence::PasteStart(1))
+            )
+        {
+            match buffer[0] {
+                b'\x1b' => {
+                    // A fresh ESC starts an independent report, even while
+                    // the discarded TTY ESC's ambiguity window is open.
+                    self.discarded_sequence = None;
+                    self.timed_tty_escape = false;
+                }
+                // Readable protocol continuations take precedence over an
+                // elapsed deadline; otherwise a paused reader leaks suffixes.
+                b'[' | b']' | b'O' => {}
+                // Other independent input after expiry (such as Ctrl+C)
+                // must not be swallowed by the discarded prefix.
+                _ => {
+                    self.finish_pending_escape();
+                }
+            }
         } else {
             self.timed_tty_escape = false;
         }

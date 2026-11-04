@@ -34,7 +34,11 @@
 //! Legacy encoding cannot distinguish Esc followed quickly by a character from
 //! an Alt-modified key. Those bytes may combine within the ambiguity window;
 //! enhanced keyboard encoding avoids that ambiguity. Discarding a pending TTY
-//! Esc also resolves within the same window, without emitting the discarded key.
+//! Esc resolves on an empty poll after the same window, without emitting the
+//! discarded key. While that discard is pending, readable CSI, OSC and SS3
+//! continuations take precedence over an elapsed deadline; a fresh ESC starts
+//! a new report. A delayed independent `[`, `]` or `O` cannot be distinguished
+//! from those continuations and may be discarded with them.
 //!
 //! ## Examples
 //!
