@@ -611,6 +611,10 @@ mod prefix_lifecycle_tests;
 mod osc_completion_tests;
 
 #[cfg(test)]
+#[path = "timed_prefix_reset_tests.rs"]
+mod timed_prefix_reset_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Parser, UnixInternalEventSource};
     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
