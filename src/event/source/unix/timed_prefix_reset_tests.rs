@@ -1,7 +1,6 @@
 use super::Parser;
 use crate::event::{
-    Event, InputDiscardStatus, InternalEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
-    MouseEventKind,
+    Event, InputDiscardStatus, InternalEvent, KeyCode, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use std::time::Instant;
 
@@ -38,7 +37,7 @@ fn complete_discard_gives_the_next_tty_escape_a_fresh_window() {
 }
 
 #[test]
-fn invalid_printable_continuations_replay_only_after_tty_expiry() {
+fn unsupported_short_frames_are_consumed_before_and_after_tty_expiry() {
     for introducer in [b'[', b'O'] {
         for expired in [false, true] {
             let mut parser = Parser::default();
@@ -48,29 +47,49 @@ fn invalid_printable_continuations_replay_only_after_tty_expiry() {
                 parser.pending_escape_deadline = Some(Instant::now());
             }
             parser.buffer_tty_input(b"x");
-            let expected = if expired {
-                vec![
-                    InternalEvent::Event(Event::Key(KeyCode::Esc.into())),
-                    InternalEvent::Event(Event::Key(KeyEvent::new(
-                        KeyCode::Char(introducer as char),
-                        if introducer == b'O' {
-                            KeyModifiers::SHIFT
-                        } else {
-                            KeyModifiers::NONE
-                        },
-                    ))),
-                    InternalEvent::Event(Event::Key(KeyCode::Char('x').into())),
-                ]
-            } else {
-                Vec::new()
-            };
             assert_eq!(
-                parser.by_ref().collect::<Vec<_>>(),
-                expected,
+                parser.next(),
+                None,
                 "introducer={introducer}, expired={expired}"
             );
             assert!(parser.buffer.is_empty());
             assert_eq!(parser.pending_escape_deadline, None);
         }
+    }
+}
+
+#[test]
+fn complete_mouse_and_unsupported_key_reports_never_turn_into_keys() {
+    // Start with a real extra-button report, then cover every other Cb value.
+    for cb in (128u8..=255).chain(0..128) {
+        let mut parser = Parser::default();
+        parser.buffer_tty_input(b"\x1b");
+        parser.pending_escape_deadline = Some(Instant::now());
+        parser.buffer_tty_input(format!("[<{cb};10;5M").as_bytes());
+        let event = parser.next();
+        assert!(
+            matches!(event, None | Some(InternalEvent::Event(Event::Mouse(_)))),
+            "Cb={cb}: complete SGR became {event:?}"
+        );
+        assert_eq!(parser.next(), None);
+        parser.buffer_tty_input(b"q");
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('q').into())))
+        );
+        assert_eq!(parser.next(), None);
+    }
+    for suffix in [b"[1;5E".as_slice(), b"[x", b"Ox"] {
+        let mut parser = Parser::default();
+        parser.buffer_tty_input(b"\x1b");
+        parser.pending_escape_deadline = Some(Instant::now());
+        parser.buffer_tty_input(suffix);
+        assert_eq!(parser.next(), None, "unsupported frame {suffix:?}");
+        parser.buffer_tty_input(b"q");
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('q').into())))
+        );
+        assert_eq!(parser.next(), None);
     }
 }
