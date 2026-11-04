@@ -560,14 +560,6 @@ impl Parser {
                         self.timed_tty_escape = false;
                     }
                 }
-                Err(_)
-                    if self.timed_tty_escape
-                        && self
-                            .pending_escape_deadline
-                            .is_some_and(|deadline| Instant::now() >= deadline) =>
-                {
-                    self.resolve_tty_prefix();
-                }
                 Err(_) => {
                     // Event can't be parsed (not enough parameters, parameter is not a number, ...).
                     // Clear the buffer and continue with another sequence.

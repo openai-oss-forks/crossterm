@@ -30,12 +30,13 @@
 //! A shorter [`poll`](crate::event::poll) timeout may return `false` while that prefix is pending.
 //! Complete enhanced-keyboard Escape sequences and standalone Ctrl+C are immediate.
 //! A CSI, OSC or SS3 prefix assembled from a timed ESC retains its original deadline.
-//! A report completed in the current TTY read takes precedence over expiry. Reads
-//! hold at most 1024 bytes, so late larger reports are not guaranteed to reassemble.
+//! Complete reports in the current TTY read are parsed or consumed before expiry.
+//! Reads hold at most 1024 bytes, so late larger reports may not reassemble.
 //! An incomplete prefix expires even while input arrives; retained bytes become
 //! Escape keys and normal input without starting another control-sequence wait.
 //! Invalid CSI/SS3 continuations in the C0, DEL or non-ASCII ranges are processed
-//! independently. Other parse errors retain their existing policy until expiry.
+//! independently. Complete unsupported or parser-rejected sequences retain their
+//! existing consumption policy even after expiry; they are not replayed as keys.
 //! Ctrl+C can also end an expired control prefix independently; inside an OSC's
 //! ambiguity window, C0 bytes retain the existing OSC content policy.
 //! A suffix cannot be reassembled after its prefix expires. Malformed UTF-8 keeps
