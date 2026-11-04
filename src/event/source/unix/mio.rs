@@ -115,10 +115,8 @@ impl EventSource for UnixInternalEventSource {
                             match self.tty_fd.read(&mut self.tty_buffer) {
                                 Ok(read_count) => {
                                     if read_count > 0 {
-                                        self.parser.buffer_input(
-                                            &self.tty_buffer[..read_count],
-                                            TTY_ESCAPE_TIMEOUT,
-                                        );
+                                        self.parser
+                                            .buffer_tty_input(&self.tty_buffer[..read_count]);
                                     }
                                 }
                                 Err(e) => {
@@ -211,6 +209,9 @@ struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
     pending_escape_deadline: Option<Instant>,
+    // Only an ambiguous bare ESC from the TTY gets finite discard expiry.
+    // Externally buffered input keeps its existing quarantine contract.
+    timed_tty_escape: bool,
     discarded_sequence: Option<DiscardedSequence>,
 }
 
@@ -246,6 +247,7 @@ impl Default for Parser {
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
             pending_escape_deadline: None,
+            timed_tty_escape: false,
             discarded_sequence: None,
         }
     }
@@ -253,6 +255,12 @@ impl Default for Parser {
 
 impl Parser {
     fn discard_buffered_input(&mut self) -> InputDiscardStatus {
+        let timed_escape = self.timed_tty_escape
+            && (self.buffer.as_slice() == b"\x1b"
+                || matches!(
+                    self.discarded_sequence,
+                    Some(DiscardedSequence::PasteStart(1))
+                ));
         if self.discarded_sequence.is_none() {
             if self.buffer.starts_with(BRACKETED_PASTE_START) {
                 let matched = (1..BRACKETED_PASTE_END.len())
@@ -278,7 +286,10 @@ impl Parser {
         }
         self.buffer.clear();
         self.internal_events.clear();
-        self.pending_escape_deadline = None;
+        if !timed_escape {
+            self.pending_escape_deadline = None;
+            self.timed_tty_escape = false;
+        }
         match self.discarded_sequence {
             Some(DiscardedSequence::PasteStart(_) | DiscardedSequence::PasteBody(_)) => {
                 InputDiscardStatus::BracketedPasteInProgress
@@ -289,13 +300,18 @@ impl Parser {
     }
 
     fn buffer_external_input(&mut self, buffer: &[u8]) {
-        self.buffer_input(buffer, BUFFERED_ESCAPE_TIMEOUT);
-    }
-
-    fn buffer_input(&mut self, buffer: &[u8], escape_timeout: Duration) {
         self.advance(buffer, true);
         if self.buffer.as_slice() == b"\x1b" {
-            self.pending_escape_deadline = Some(Instant::now() + escape_timeout);
+            self.pending_escape_deadline = Some(Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
+            self.timed_tty_escape = false;
+        }
+    }
+
+    fn buffer_tty_input(&mut self, buffer: &[u8]) {
+        self.advance(buffer, true);
+        if self.buffer.as_slice() == b"\x1b" {
+            self.pending_escape_deadline = Some(Instant::now() + TTY_ESCAPE_TIMEOUT);
+            self.timed_tty_escape = true;
         }
     }
 
@@ -313,12 +329,33 @@ impl Parser {
             return None;
         }
         self.pending_escape_deadline = None;
+        if self.timed_tty_escape
+            && matches!(
+                self.discarded_sequence,
+                Some(DiscardedSequence::PasteStart(1))
+            )
+        {
+            self.discarded_sequence = None;
+            self.timed_tty_escape = false;
+            return None;
+        }
+        self.timed_tty_escape = false;
         let event = parse_event(&self.buffer, false).ok().flatten()?;
         self.buffer.clear();
         Some(event)
     }
 
     fn advance(&mut self, buffer: &[u8], more: bool) {
+        if buffer.is_empty() {
+            return;
+        }
+        if self.timed_tty_escape && self.discarded_sequence.is_some() {
+            // A new independent key after the discarded TTY ESC's deadline
+            // must not be swallowed as its continuation.
+            self.finish_pending_escape();
+        } else {
+            self.timed_tty_escape = false;
+        }
         self.pending_escape_deadline = None;
         for (idx, byte) in buffer.iter().enumerate() {
             if let Some(discarded_sequence) = self.discarded_sequence {
@@ -399,6 +436,15 @@ impl Parser {
             }
             let more = idx + 1 < buffer.len() || more;
 
+            if self.buffer.as_slice() == b"\x1b" && *byte == b'\x1b' {
+                // The first Esc is complete; the second starts a new report
+                // or another Esc. Do not consume the new sequence's prefix.
+                self.internal_events
+                    .push_back(InternalEvent::Event(Event::Key(
+                        crate::event::KeyCode::Esc.into(),
+                    )));
+                self.buffer.clear();
+            }
             self.buffer.push(*byte);
 
             match parse_event(&self.buffer, more) {
@@ -427,6 +473,16 @@ impl Parser {
                     // Clear the buffer and continue with another sequence.
                     self.buffer.clear();
                 }
+            }
+        }
+        if self.timed_tty_escape {
+            if matches!(
+                self.discarded_sequence,
+                Some(DiscardedSequence::PasteStart(1))
+            ) {
+                self.pending_escape_deadline = Some(Instant::now() + TTY_ESCAPE_TIMEOUT);
+            } else {
+                self.timed_tty_escape = false;
             }
         }
     }

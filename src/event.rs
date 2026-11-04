@@ -31,6 +31,10 @@
 //! Complete enhanced-keyboard Escape sequences and Ctrl+C do not wait for this
 //! ambiguity window. Once the window expires without a continuation, the input
 //! is reported as a legacy Escape key; a later suffix cannot be reassembled.
+//! Legacy encoding cannot distinguish Esc followed quickly by a character from
+//! an Alt-modified key. Those bytes may combine within the ambiguity window;
+//! enhanced keyboard encoding avoids that ambiguity. Discarding a pending TTY
+//! Esc also resolves within the same window, without emitting the discarded key.
 //!
 //! ## Examples
 //!
