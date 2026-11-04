@@ -449,6 +449,10 @@ mod secondary_device_attributes_tests;
 mod fragmented_input_tests;
 
 #[cfg(test)]
+#[path = "escape_lifecycle_tests.rs"]
+mod escape_lifecycle_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Parser, UnixInternalEventSource};
     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
