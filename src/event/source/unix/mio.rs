@@ -72,6 +72,12 @@ impl UnixInternalEventSource {
             waker,
         })
     }
+
+    fn has_pending_input(&self) -> io::Result<bool> {
+        // The source owns this descriptor for the lifetime of its borrow.
+        let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
+        Ok(rustix::io::ioctl_fionread(fd)? != 0)
+    }
 }
 
 impl EventSource for UnixInternalEventSource {
@@ -82,9 +88,10 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if self.pending_tty_readable {
-                self.pending_tty_readable = false;
-            } else {
+            // An external input handoff may have consumed the previously readable bytes.
+            let pending_tty_readable = self.pending_tty_readable && self.has_pending_input()?;
+            self.pending_tty_readable = false;
+            if !pending_tty_readable {
                 let poll_timeout = self.parser.poll_timeout(timeout.leftover());
                 if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
                     // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
@@ -128,14 +135,16 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
+                            let has_pending_input = self.has_pending_input()?;
+
                             if let Some(event) = self.parser.next() {
+                                // Mio is edge-triggered, so unread input may not produce another
+                                // readiness event after the parser's queued events are consumed.
+                                self.pending_tty_readable = has_pending_input;
                                 return Ok(Some(event));
                             }
 
-                            // The source owns this descriptor for the lifetime of its borrow.
-                            let fd =
-                                unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
-                            if rustix::io::ioctl_fionread(fd)? == 0 {
+                            if !has_pending_input {
                                 break;
                             }
                             if timeout.elapsed() {
@@ -455,6 +464,61 @@ mod tests {
             UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
             writer,
         )
+    }
+
+    #[test]
+    fn queued_mouse_events_are_drained_without_new_writes() {
+        use crate::event::{KeyModifiers, MouseEvent, MouseEventKind};
+
+        let (mut source, mut writer) = source_with_input();
+        let mut input = b"\x1b[<65;40;20M".repeat(256);
+        input.push(b'x');
+        writer.write_all(&input).unwrap();
+
+        for index in 0..256 {
+            assert_eq!(
+                source.try_read(Some(Duration::ZERO)).unwrap(),
+                Some(InternalEvent::Event(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 39,
+                    row: 19,
+                    modifiers: KeyModifiers::NONE,
+                }))),
+                "missing scroll event {index}",
+            );
+        }
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('x').into())))
+        );
+        assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), None);
+    }
+
+    #[test]
+    fn externally_consumed_input_does_not_leave_stale_readiness() {
+        let (mut source, mut writer) = source_with_input();
+        writer
+            .write_all(&vec![b'x'; super::TTY_BUFFER_SIZE + 1])
+            .unwrap();
+        assert!(source.try_read(Some(Duration::ZERO)).unwrap().is_some());
+
+        let mut remaining = [0];
+        assert_eq!(source.tty_fd.read(&mut remaining).unwrap(), 1);
+        source.buffer_input(&remaining, &mut Default::default());
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let consumer = std::thread::spawn(move || {
+            result_tx
+                .send(source.try_read(Some(Duration::ZERO)).unwrap())
+                .unwrap();
+        });
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            // Release a blocking read so a regression fails instead of hanging the suite.
+            writer.write_all(b"y").unwrap();
+        }
+        consumer.join().unwrap();
+        assert_eq!(result.unwrap(), None);
     }
 
     #[test]
