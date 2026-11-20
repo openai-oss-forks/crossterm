@@ -204,13 +204,12 @@ pub(crate) fn parse_osc_rgb(payload: &str) -> Option<(u8, u8, u8)> {
 }
 
 fn parse_osc_component(component: &str) -> Option<u8> {
-    match component.len() {
-        2 => u8::from_str_radix(component, 16).ok(),
-        4 => u16::from_str_radix(component, 16)
-            .ok()
-            .map(|value| (value / 257) as u8),
-        _ => None,
+    if !(1..=4).contains(&component.len()) {
+        return None;
     }
+    let value = u32::from(u16::from_str_radix(component, 16).ok()?);
+    let maximum = (1_u32 << (component.len() * 4)) - 1;
+    Some((value * 255 / maximum) as u8)
 }
 
 impl TryFrom<&str> for Color {
@@ -418,11 +417,13 @@ mod tests {
 
     #[test]
     fn test_parse_osc_rgb_short_components() {
+        assert_eq!(parse_osc_rgb("rgb:f/0/7"), Some((255, 0, 119)));
         assert_eq!(parse_osc_rgb("rgb:ff/00/7f"), Some((255, 0, 127)));
     }
 
     #[test]
     fn test_parse_osc_rgb_long_components() {
+        assert_eq!(parse_osc_rgb("rgb:fff/800/000"), Some((255, 127, 0)));
         assert_eq!(parse_osc_rgb("rgb:ffff/8000/0000"), Some((255, 127, 0)));
     }
 
