@@ -54,6 +54,7 @@
 //!             #[cfg(feature = "bracketed-paste")]
 //!             Event::Paste(data) => println!("{:?}", data),
 //!             Event::Resize(width, height) => println!("New size {}x{}", width, height),
+//!             Event::CellSize(width, height) => println!("Cell pixels {}x{}", width, height),
 //!         }
 //!     }
 //!     execute!(
@@ -100,6 +101,7 @@
 //!                 #[cfg(feature = "bracketed-paste")]
 //!                 Event::Paste(data) => println!("Pasted {:?}", data),
 //!                 Event::Resize(width, height) => println!("New size {}x{}", width, height),
+//!                 Event::CellSize(width, height) => println!("Cell pixels {}x{}", width, height),
 //!             }
 //!         } else {
 //!             // Timeout expired and no `Event` is available
@@ -591,6 +593,9 @@ pub enum Event {
     /// A resize event with new dimensions after resize (columns, rows).
     /// **Note** that resize events can occur in batches.
     Resize(u16, u16),
+    /// A response to CSI 16 t: the terminal cell width and height in pixels.
+    /// Zero dimensions mean that the terminal could not supply a usable size.
+    CellSize(u16, u16),
 }
 
 impl Event {

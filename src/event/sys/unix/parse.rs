@@ -256,6 +256,17 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
                         b'~' => return parse_csi_special_key_code(buffer),
                         b'u' => return parse_csi_u_encoded_key_code(buffer),
                         b'R' => return parse_csi_cursor_position(buffer),
+                        b't' if buffer.starts_with(b"\x1b[6;") => {
+                            let fields = std::str::from_utf8(&buffer[4..buffer.len() - 1])
+                                .ok()
+                                .and_then(|fields| fields.split_once(';'))
+                                .and_then(|(height, width)| {
+                                    Some((width.parse::<u16>().ok()?, height.parse::<u16>().ok()?))
+                                });
+                            return Ok(fields.map(|(width, height)| {
+                                InternalEvent::Event(Event::CellSize(width, height))
+                            }));
+                        }
                         _ => return parse_csi_modifier_key_code(buffer),
                     }
                 }
@@ -265,6 +276,23 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     };
 
     Ok(input_event.map(InternalEvent::Event))
+}
+
+/// A truncated cell report must not absorb the start of another input sequence or a key.
+/// Keep the ambiguous modified PageDown prefix (CSI 6; modifier ~) on its normal path.
+pub(crate) fn interrupted_cell_size_report(buffer: &[u8], next: u8) -> bool {
+    if buffer != b"\x1b[6" && !buffer.starts_with(b"\x1b[6;") {
+        return false;
+    }
+    if buffer.len() >= 64 {
+        return true;
+    }
+    let cell_fields = buffer.get(4..).is_some_and(|fields| fields.contains(&b';'));
+    !next.is_ascii_digit()
+        && next != b';'
+        && next != b't'
+        // A cursor report (row 6), modified PageDown, and CSI-u still use their normal parser.
+        && (cell_fields || !b":~uR".contains(&next))
 }
 
 pub(crate) fn next_parsed<T>(iter: &mut dyn Iterator<Item = &str>) -> io::Result<T>

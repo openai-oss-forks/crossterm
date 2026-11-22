@@ -397,6 +397,9 @@ impl Parser {
                     )));
                 self.buffer.clear();
             }
+            if crate::event::sys::unix::parse::interrupted_cell_size_report(&self.buffer, *byte) {
+                self.buffer.clear();
+            }
             self.buffer.push(*byte);
 
             match parse_event(&self.buffer, more) {
@@ -443,13 +446,17 @@ impl Iterator for Parser {
 mod secondary_device_attributes_tests;
 
 #[cfg(test)]
+#[path = "../cell_size_tests.rs"]
+mod cell_size_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Parser, UnixInternalEventSource};
     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
     use crate::terminal::sys::file_descriptor::FileDesc;
     use std::{io::Write, os::unix::net::UnixStream};
 
-    fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
+    pub(super) fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
         let (reader, writer) = UnixStream::pair().unwrap();
         #[cfg(feature = "libc")]
         let reader = {
