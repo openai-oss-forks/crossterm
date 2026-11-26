@@ -976,7 +976,7 @@ bitflags! {
 
 /// Represents a key event.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct KeyEvent {
     /// The key itself.
     pub code: KeyCode,
@@ -993,16 +993,23 @@ pub struct KeyEvent {
     /// Only set if [`KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES`] has been enabled with
     /// [`PushKeyboardEnhancementFlags`].
     pub state: KeyEventState,
+    #[cfg(feature = "base-layout-key")]
+    /// The base layout character and its modifiers, when reported by the terminal.
+    ///
+    /// With Kitty's [`KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS`], a Russian
+    /// Ctrl+с can report `('c', KeyModifiers::CONTROL)` here. The modifiers
+    /// include Shift even when the active layout's shifted character in
+    /// [`code`](Self::code) consumes it. Comparisons and hashing use the active key.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub base_layout: Option<(char, KeyModifiers)>,
 }
 
 impl KeyEvent {
     pub const fn new(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::empty(),
-        }
+        Self::new_with_kind(code, modifiers, KeyEventKind::Press)
     }
 
     pub const fn new_with_kind(
@@ -1010,12 +1017,7 @@ impl KeyEvent {
         modifiers: KeyModifiers,
         kind: KeyEventKind,
     ) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers,
-            kind,
-            state: KeyEventState::empty(),
-        }
+        Self::new_with_kind_and_state(code, modifiers, kind, KeyEventState::empty())
     }
 
     pub const fn new_with_kind_and_state(
@@ -1029,7 +1031,13 @@ impl KeyEvent {
             modifiers,
             kind,
             state,
+            #[cfg(feature = "base-layout-key")]
+            base_layout: None,
         }
+    }
+
+    fn parts(self) -> (KeyCode, KeyModifiers, KeyEventKind, KeyEventState) {
+        (self.code, self.modifiers, self.kind, self.state)
     }
 
     // modifies the KeyEvent,
@@ -1067,33 +1075,13 @@ impl KeyEvent {
 
 impl From<KeyCode> for KeyEvent {
     fn from(code: KeyCode) -> Self {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::empty(),
-            kind: KeyEventKind::Press,
-            state: KeyEventState::empty(),
-        }
+        Self::new(code, KeyModifiers::empty())
     }
 }
 
 impl PartialEq for KeyEvent {
     fn eq(&self, other: &KeyEvent) -> bool {
-        let KeyEvent {
-            code: lhs_code,
-            modifiers: lhs_modifiers,
-            kind: lhs_kind,
-            state: lhs_state,
-        } = self.normalize_case();
-        let KeyEvent {
-            code: rhs_code,
-            modifiers: rhs_modifiers,
-            kind: rhs_kind,
-            state: rhs_state,
-        } = other.normalize_case();
-        (lhs_code == rhs_code)
-            && (lhs_modifiers == rhs_modifiers)
-            && (lhs_kind == rhs_kind)
-            && (lhs_state == rhs_state)
+        self.normalize_case().parts() == other.normalize_case().parts()
     }
 }
 
@@ -1101,16 +1089,19 @@ impl Eq for KeyEvent {}
 
 impl Hash for KeyEvent {
     fn hash<H: Hasher>(&self, hash_state: &mut H) {
-        let KeyEvent {
-            code,
-            modifiers,
-            kind,
-            state,
-        } = self.normalize_case();
-        code.hash(hash_state);
-        modifiers.hash(hash_state);
-        kind.hash(hash_state);
-        state.hash(hash_state);
+        self.normalize_case().parts().hash(hash_state);
+    }
+}
+
+impl PartialOrd for KeyEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KeyEvent {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.parts().cmp(&other.parts())
     }
 }
 

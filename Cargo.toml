@@ -43,6 +43,9 @@ derive-more = ["dep:derive_more"]
 ## Enables documentation for crate features.
 document-features = ["dep:document-features"]
 
+## Adds the terminal-reported base layout character and its modifiers to [KeyEvent](event::KeyEvent).
+base-layout-key = ["events"]
+
 ## Enables the [EventStream](event::EventStream) struct for async event reading.
 event-stream = ["dep:futures-core", "events"]
 

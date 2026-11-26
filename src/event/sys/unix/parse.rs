@@ -644,27 +644,27 @@ pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<I
         }
     }
 
-    // When the "report alternate keys" flag is enabled in the Kitty Keyboard Protocol
-    // and the terminal sends a keyboard event containing shift, the sequence will
-    // contain an additional codepoint separated by a ':' character which contains
-    // the shifted character according to the keyboard layout.
+    // Kitty reports the shifted character and the base layout key in separate
+    // slots. An empty shifted slot (`1089::99`) still precedes the base key.
+    let mut alternate = || char::from_u32(codepoints.next()?.parse().ok()?);
+    let shifted = alternate();
+    #[cfg(feature = "base-layout-key")]
+    let base_layout = alternate().map(|ch| (ch, modifiers));
     if modifiers.contains(KeyModifiers::SHIFT) {
-        if let Some(shifted_c) = codepoints
-            .next()
-            .and_then(|codepoint| codepoint.parse::<u32>().ok())
-            .and_then(char::from_u32)
-        {
-            keycode = KeyCode::Char(shifted_c);
+        if let Some(ch) = shifted {
+            keycode = KeyCode::Char(ch);
             modifiers.set(KeyModifiers::SHIFT, false);
         }
     }
 
-    let input_event = Event::Key(KeyEvent::new_with_kind_and_state(
-        keycode,
+    let input_event = Event::Key(KeyEvent {
+        code: keycode,
         modifiers,
         kind,
-        state_from_keycode | state_from_modifiers,
-    ));
+        state: state_from_keycode | state_from_modifiers,
+        #[cfg(feature = "base-layout-key")]
+        base_layout,
+    });
 
     Ok(Some(InternalEvent::Event(input_event)))
 }
@@ -918,9 +918,26 @@ pub(crate) fn parse_utf8_char(buffer: &[u8]) -> io::Result<Option<char>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "base-layout-key")]
+    use std::collections::hash_map::DefaultHasher;
+    #[cfg(feature = "base-layout-key")]
+    use std::hash::{Hash, Hasher};
+
     use crate::event::{KeyEventState, KeyModifiers, MouseButton, MouseEvent};
 
     use super::*;
+
+    #[cfg(feature = "base-layout-key")]
+    /// Parses a sequence that is expected to yield exactly one key event.
+    ///
+    /// Needed where a field is asserted directly instead of through
+    /// `assert_eq!` on the whole event, which compares by key identity only.
+    fn key_event(bytes: &[u8]) -> KeyEvent {
+        match parse_event(bytes, false).unwrap() {
+            Some(InternalEvent::Event(Event::Key(key))) => key,
+            other => panic!("expected a key event, got {:?}", other),
+        }
+    }
 
     #[test]
     fn test_esc_key() {
@@ -1599,6 +1616,53 @@ mod tests {
                 KeyModifiers::ALT,
             )))),
         );
+    }
+
+    #[cfg(feature = "base-layout-key")]
+    #[test]
+    fn test_parse_csi_u_with_base_layout_key() {
+        use KeyEventKind::{Press, Release, Repeat};
+        let ctrl = KeyModifiers::CONTROL;
+        for (sequence, active, kind, base) in [
+            ("\x1b[1089::99;5u", 'с', Press, Some(('c', ctrl))),
+            ("\x1b[1074::100;5:1u", 'в', Press, Some(('d', ctrl))),
+            ("\x1b[1089::99;5:2u", 'с', Repeat, Some(('c', ctrl))),
+            ("\x1b[1074::100;5:3u", 'в', Release, Some(('d', ctrl))),
+            (
+                "\x1b[1089:1057:99;6u",
+                'С',
+                Press,
+                Some(('c', ctrl | KeyModifiers::SHIFT)),
+            ),
+            ("\x1b[1089;5u", 'с', Press, None),
+            ("\x1b[1089:1057;5u", 'с', Press, None),
+            ("\x1b[1089::bad;5u", 'с', Press, None),
+            ("\x1b[1089::1114112;5u", 'с', Press, None),
+        ] {
+            let event = key_event(sequence.as_bytes());
+            assert_eq!(
+                (event, event.base_layout),
+                (
+                    KeyEvent::new_with_kind(KeyCode::Char(active), ctrl, kind),
+                    base
+                ),
+                "{sequence:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "base-layout-key")]
+    #[test]
+    fn test_base_layout_key_does_not_affect_equality() {
+        let reported = key_event(b"\x1b[1089::99;5u");
+        let primary = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL);
+        assert_eq!(reported, primary);
+        assert_eq!(reported.cmp(&primary), std::cmp::Ordering::Equal);
+        let mut with_base = DefaultHasher::new();
+        reported.hash(&mut with_base);
+        let mut without_base = DefaultHasher::new();
+        primary.hash(&mut without_base);
+        assert_eq!(with_base.finish(), without_base.finish());
     }
 
     #[test]

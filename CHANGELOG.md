@@ -9,6 +9,10 @@
 
 ## Changed ⚙️
 
+- The `base-layout-key` feature adds `KeyEvent::base_layout`, which exposes the
+  character and original modifiers from Kitty's base layout field. Enabling it
+  requires struct literals and exhaustive patterns to account for the field.
+
 - Migrate the crate to the Rust 2024 edition. This does not raise the MSRV beyond Rust 1.85.
 
 ## Fixed 🐛
