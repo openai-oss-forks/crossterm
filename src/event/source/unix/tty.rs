@@ -44,9 +44,11 @@ impl WakePipe {
 // reading on macOS/Linux -> we don't need bigger buffer and 1k of bytes
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
-const BUFFERED_ESCAPE_TIMEOUT: Duration = Duration::from_millis(20);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+#[path = "pending_escape.rs"]
+mod pending_escape;
 
 pub(crate) struct UnixInternalEventSource {
     parser: Parser,
@@ -109,6 +111,9 @@ fn read_complete(fd: &FileDesc, buf: &mut [u8]) -> io::Result<usize> {
 
 impl EventSource for UnixInternalEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+        if let Some(event) = self.parser.next() {
+            return Ok(Some(event));
+        }
         let timeout = PollTimeout::new(timeout);
 
         fn make_pollfd<F: AsRawFd>(fd: &F) -> pollfd {
@@ -135,10 +140,6 @@ impl EventSource for UnixInternalEventSource {
         while timeout.leftover().is_none_or(|t| !t.is_zero())
             || self.parser.pending_escape_expired()
         {
-            // check if there are buffered events from the last read
-            if let Some(event) = self.parser.next() {
-                return Ok(Some(event));
-            }
             match poll(&mut fds, self.parser.poll_timeout(timeout.leftover())) {
                 Err(filedescriptor::Error::Poll(e)) | Err(filedescriptor::Error::Io(e)) => {
                     match e.kind() {
@@ -323,35 +324,12 @@ impl Parser {
         }
     }
 
-    fn buffer_external_input(&mut self, buffer: &[u8]) {
-        self.advance(buffer, true);
-        if self.buffer.as_slice() == b"\x1b" {
-            self.pending_escape_deadline = Some(Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
-        }
-    }
-
     fn poll_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
         let Some(deadline) = self.pending_escape_deadline else {
             return timeout;
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)))
-    }
-
-    fn pending_escape_expired(&self) -> bool {
-        self.pending_escape_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    }
-
-    fn finish_pending_escape(&mut self) -> Option<InternalEvent> {
-        let deadline = self.pending_escape_deadline?;
-        if Instant::now() < deadline {
-            return None;
-        }
-        self.pending_escape_deadline = None;
-        let event = parse_event(&self.buffer, false).ok().flatten()?;
-        self.buffer.clear();
-        Some(event)
     }
 
     fn advance(&mut self, buffer: &[u8], more: bool) {
@@ -435,6 +413,8 @@ impl Parser {
             }
             let more = idx + 1 < buffer.len() || more;
 
+            self.interrupt_pending_osc(*byte);
+
             // A second Escape starts another input sequence. Emit the first one
             // without consuming the prefix of the next report.
             if self.buffer.as_slice() == b"\x1b" && *byte == b'\x1b' {
@@ -496,7 +476,7 @@ mod tests {
     use crate::terminal::sys::file_descriptor::FileDesc;
     use std::{io::Write, os::unix::net::UnixStream};
 
-    fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
+    pub(super) fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
         let (reader, writer) = UnixStream::pair().unwrap();
         #[cfg(feature = "libc")]
         let reader = {
