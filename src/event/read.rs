@@ -9,7 +9,10 @@ use crate::event::source::windows::WindowsEventSource;
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{
-    filter::Filter, internal::InternalEvent, source::EventSource, timeout::PollTimeout,
+    filter::Filter,
+    internal::InternalEvent,
+    source::{EventSource, ReadGoal},
+    timeout::PollTimeout,
 };
 
 /// Can be used to read `InternalEvent`s.
@@ -59,6 +62,81 @@ impl InternalEventReader {
         Ok(status)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn discard_buffered_input_after_poll(&mut self) -> io::Result<InputDiscardStatus> {
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|source| source.has_pending_escape())
+        {
+            return Ok(InputDiscardStatus::ControlSequenceInProgress);
+        }
+        self.discard_buffered_input()
+    }
+
+    #[cfg(all(feature = "event-stream", unix))]
+    pub(crate) fn discard_matching(&mut self, matches: fn(&InternalEvent) -> bool) {
+        self.events.retain(|event| !matches(event));
+        self.skipped_events.retain(|event| !matches(event));
+        if let Some(source) = &mut self.source {
+            source.discard_matching(matches);
+        }
+    }
+
+    #[cfg(all(feature = "event-stream", unix))]
+    pub(crate) fn can_query(&self) -> bool {
+        !self.events.iter().any(InternalEvent::is_palette_report)
+            && self
+                .source
+                .as_ref()
+                .is_some_and(|source| source.can_query())
+    }
+
+    #[cfg(all(feature = "event-stream", unix))]
+    pub(crate) fn prepare_color_query(&mut self) -> bool {
+        if !self.can_query() {
+            return false;
+        }
+        self.source
+            .as_mut()
+            .expect("ready reader")
+            .expect_color_replies();
+        true
+    }
+
+    // Consume input that predates the handoff marker through the same parser.
+    // In particular, never write a reply into a partially received paste.
+    #[cfg(all(feature = "event-stream", unix))]
+    pub(crate) fn prepare_color_handoff(&mut self, timeout: &PollTimeout) -> io::Result<bool> {
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?;
+        while !source.can_query() {
+            if timeout.elapsed() {
+                return Ok(false);
+            }
+            match source.read_until(timeout.leftover(), ReadGoal::EventOrQueryBoundary) {
+                Ok(Some(event)) => self.events.push_back(event),
+                Ok(None) if source.can_query() => break,
+                Ok(None) => return Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        // A stale DA1 may be queued behind the last key in the parser.
+        self.discard_matching(InternalEvent::is_handoff_report);
+        Ok(!timeout.elapsed())
+    }
+
+    #[cfg(all(feature = "event-stream", unix))]
+    pub(crate) fn finish_color_handoff(&mut self) {
+        self.discard_matching(InternalEvent::is_handoff_report);
+        if let Some(source) = &mut self.source {
+            source.finish_color_handoff();
+        }
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
@@ -69,6 +147,16 @@ impl InternalEventReader {
     where
         F: Filter,
     {
+        self.poll_until(timeout, filter, ReadGoal::Event)
+    }
+
+    /// True when the caller can make progress toward its read goal.
+    pub(crate) fn poll_until(
+        &mut self,
+        timeout: Option<Duration>,
+        filter: &impl Filter,
+        goal: ReadGoal,
+    ) -> io::Result<bool> {
         for event in &self.events {
             if filter.eval(event) {
                 return Ok(true);
@@ -83,17 +171,25 @@ impl InternalEventReader {
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
-            let maybe_event = match event_source.try_read(poll_timeout.leftover()) {
+            let maybe_event = match event_source.read_until(poll_timeout.leftover(), goal) {
+                Ok(None) if goal.boundary_reached(event_source.as_ref()) => {
+                    self.events.extend(self.skipped_events.drain(..));
+                    return Ok(true);
+                }
                 Ok(None) => None,
                 Ok(Some(event)) => {
                     if filter.eval(&event) {
                         Some(event)
                     } else {
-                        self.skipped_events.push(event);
+                        if !filter.discard_unmatched(&event) {
+                            self.skipped_events.push(event);
+                        }
                         None
                     }
                 }
                 Err(e) => {
+                    // Cancellation can hand the queue directly to a different filter.
+                    self.events.extend(self.skipped_events.drain(..));
                     if e.kind() == io::ErrorKind::Interrupted {
                         return Ok(false);
                     }
@@ -106,7 +202,7 @@ impl InternalEventReader {
                 self.events.extend(self.skipped_events.drain(..));
 
                 if let Some(event) = maybe_event {
-                    self.events.push_front(event);
+                    self.events.push_back(event);
                     return Ok(true);
                 }
 
@@ -157,8 +253,10 @@ impl InternalEventReader {
             skipped_events.push(event);
         }
 
-        // push all skipped events back to the event queue
-        self.events.extend(skipped_events);
+        // Skipped events preceded the unread tail; keep them in that order.
+        for event in skipped_events.into_iter().rev() {
+            self.events.push_front(event);
+        }
 
         result
     }
@@ -172,6 +270,17 @@ mod tests {
     #[cfg(unix)]
     use super::super::filter::CursorPositionFilter;
     use super::{super::Event, EventSource, Filter, InternalEvent, InternalEventReader};
+
+    #[cfg(all(unix, feature = "event-stream"))]
+    impl InternalEventReader {
+        pub(crate) fn with_test_source(source: impl EventSource + 'static) -> Self {
+            Self {
+                events: VecDeque::new(),
+                source: Some(Box::new(source)),
+                skipped_events: Vec::new(),
+            }
+        }
+    }
 
     #[derive(Debug, Clone)]
     pub(crate) struct InternalEventFilter;
@@ -280,7 +389,12 @@ mod tests {
         const CURSOR_EVENT: InternalEvent = InternalEvent::CursorPosition(10, 20);
 
         let mut reader = InternalEventReader {
-            events: vec![SKIPPED_EVENT, CURSOR_EVENT].into(),
+            events: vec![
+                SKIPPED_EVENT,
+                CURSOR_EVENT,
+                InternalEvent::Event(Event::Resize(30, 40)),
+            ]
+            .into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
         };
@@ -318,6 +432,65 @@ mod tests {
                 InternalEvent::Event(Event::Resize(20, 20)),
             ])
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ordinary_input_discards_unsolicited_color_scheme_reports() {
+        let key = InternalEvent::Event(Event::Key(crate::event::KeyCode::Char('x').into()));
+        let source = FakeSource::with_events(&[
+            InternalEvent::ColorSchemeChanged,
+            InternalEvent::ColorSchemeReporting(2),
+            key.clone(),
+        ]);
+        let mut reader = InternalEventReader {
+            skipped_events: Vec::new(),
+            events: VecDeque::new(),
+            source: Some(Box::new(source)),
+        };
+        assert_eq!(
+            reader.read(&crate::event::filter::EventFilter).unwrap(),
+            key
+        );
+        assert_eq!(reader.try_read(&InternalEventFilter), None);
+    }
+
+    #[cfg(all(unix, feature = "event-stream"))]
+    #[test]
+    fn handoff_clears_old_markers_and_preserves_input_order() {
+        let first = InternalEvent::Event(Event::Resize(10, 10));
+        let last = InternalEvent::Event(Event::Resize(20, 20));
+        let marker = InternalEvent::PrimaryDeviceAttributes;
+        let mut reader = InternalEventReader {
+            skipped_events: Vec::new(),
+            events: VecDeque::from([first.clone(), marker.clone()]),
+            source: Some(Box::new(FakeSource::with_events(&[
+                InternalEvent::ColorSchemeReporting(2),
+                last.clone(),
+                marker,
+            ]))),
+        };
+        let timeout = super::PollTimeout::new(Some(Duration::from_secs(1)));
+        assert!(reader.prepare_color_handoff(&timeout).unwrap());
+        assert_eq!(reader.events, VecDeque::from([first, last]));
+
+        // A late DA1 or a previous retry cannot answer the next numbered query.
+        reader
+            .events
+            .push_back(InternalEvent::PrimaryDeviceAttributes);
+        reader.discard_buffered_input().unwrap();
+        let retry = InternalEvent::ColorHandoffMarker(30001);
+        let key = InternalEvent::Event(Event::Key(crate::event::KeyCode::Char('x').into()));
+        reader.source = Some(Box::new(FakeSource::with_events(&[
+            InternalEvent::PrimaryDeviceAttributes,
+            InternalEvent::ColorHandoffMarker(30000),
+            key.clone(),
+            retry.clone(),
+        ])));
+        assert!(reader.poll(timeout.leftover(), &retry).unwrap());
+        assert_eq!(reader.try_read(&retry), Some(retry));
+        reader.finish_color_handoff();
+        assert_eq!(reader.events, VecDeque::from([key]));
     }
 
     #[test]
@@ -568,6 +741,22 @@ mod tests {
         fn discard_buffered_input(&mut self) -> super::InputDiscardStatus {
             self.events.clear();
             super::InputDiscardStatus::Complete
+        }
+
+        #[cfg(all(feature = "event-stream", unix))]
+        fn expect_color_replies(&mut self) {}
+
+        #[cfg(all(feature = "event-stream", unix))]
+        fn finish_color_handoff(&mut self) {}
+
+        #[cfg(all(feature = "event-stream", unix))]
+        fn can_query(&self) -> bool {
+            self.events.is_empty()
+        }
+
+        #[cfg(all(feature = "event-stream", unix))]
+        fn discard_matching(&mut self, matches: fn(&InternalEvent) -> bool) {
+            self.events.retain(|event| !matches(event));
         }
 
         #[cfg(feature = "event-stream")]

@@ -7,6 +7,7 @@ use std::{
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use signal_hook_mio::v1_0::Signals;
 
+use crate::event::source::ReadGoal;
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{
@@ -25,17 +26,19 @@ const WAKE_TOKEN: Token = Token(2);
 // reading on macOS/Linux -> we don't need bigger buffer and 1k of bytes
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
-const BUFFERED_ESCAPE_TIMEOUT: Duration = Duration::from_millis(20);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+#[path = "pending_escape.rs"]
+mod pending_escape;
 
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
     events: Events,
+    pending_events: VecDeque<Token>,
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
-    pending_tty_readable: bool,
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
@@ -63,10 +66,10 @@ impl UnixInternalEventSource {
         Ok(UnixInternalEventSource {
             poll,
             events: Events::with_capacity(3),
+            pending_events: VecDeque::with_capacity(3),
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
-            pending_tty_readable: false,
             signals,
             #[cfg(feature = "event-stream")]
             waker,
@@ -76,15 +79,27 @@ impl UnixInternalEventSource {
 
 impl EventSource for UnixInternalEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+        self.read_until(timeout, ReadGoal::Event)
+    }
+
+    fn read_until(
+        &mut self,
+        timeout: Option<Duration>,
+        goal: ReadGoal,
+    ) -> io::Result<Option<InternalEvent>> {
         if let Some(event) = self.parser.next() {
             return Ok(Some(event));
         }
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if self.pending_tty_readable {
-                self.pending_tty_readable = false;
-            } else {
+            if goal.boundary_reached(self) {
+                return Ok(None);
+            }
+            // Finish the previous readiness batch before returning to a readable TTY. A wake
+            // behind a cursor reply must still interrupt a filtered, otherwise unbounded poll.
+            let resuming_batch = !self.pending_events.is_empty();
+            if !resuming_batch {
                 let poll_timeout = self.parser.poll_timeout(timeout.leftover());
                 if let Err(e) = self.poll.poll(&mut self.events, poll_timeout) {
                     // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
@@ -96,16 +111,21 @@ impl EventSource for UnixInternalEventSource {
                         return Err(e);
                     }
                 }
-
                 if self.events.is_empty() {
                     // No readiness events = timeout
                     return Ok(self.parser.finish_pending_escape());
                 }
+                self.pending_events
+                    .extend(self.events.iter().map(mio::event::Event::token));
             }
 
-            for token in self.events.iter().map(|x| x.token()) {
+            while let Some(token) = self.pending_events.pop_front() {
                 match token {
                     TTY_TOKEN => {
+                        // An external input owner may have drained this readiness edge.
+                        if resuming_batch && super::unread_bytes(&self.tty_fd)? == 0 {
+                            continue;
+                        }
                         loop {
                             match self.tty_fd.read(&mut self.tty_buffer) {
                                 Ok(read_count) => {
@@ -126,19 +146,16 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
-                            if let Some(event) = self.parser.next() {
-                                return Ok(Some(event));
+                            let unread_bytes = super::unread_bytes(&self.tty_fd)?;
+                            let event = self.parser.next();
+                            if event.is_some() || (unread_bytes > 0 && timeout.elapsed()) {
+                                if unread_bytes > 0 {
+                                    self.pending_events.push_back(TTY_TOKEN);
+                                }
+                                return Ok(event.or_else(|| self.parser.finish_pending_escape()));
                             }
-
-                            // The source owns this descriptor for the lifetime of its borrow.
-                            let fd =
-                                unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty_fd.raw_fd()) };
-                            if rustix::io::ioctl_fionread(fd)? == 0 {
+                            if unread_bytes == 0 {
                                 break;
-                            }
-                            if timeout.elapsed() {
-                                self.pending_tty_readable = true;
-                                return Ok(self.parser.finish_pending_escape());
                             }
                         }
                     }
@@ -175,7 +192,7 @@ impl EventSource for UnixInternalEventSource {
     }
 
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>) {
-        self.parser.buffer_external_input(input);
+        self.parser.buffer_replayed_input(input);
         events.extend(
             self.parser
                 .by_ref()
@@ -185,6 +202,37 @@ impl EventSource for UnixInternalEventSource {
 
     fn discard_buffered_input(&mut self) -> InputDiscardStatus {
         self.parser.discard_buffered_input()
+    }
+
+    fn has_pending_escape(&self) -> bool {
+        self.parser.has_pending_escape_key()
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn expect_color_replies(&mut self) {
+        self.parser.color_queries.begin();
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn finish_color_handoff(&mut self) {
+        self.parser.finish_color_handoff();
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn can_query(&self) -> bool {
+        self.parser.buffer.is_empty()
+            && self.parser.discarded_sequence.is_none()
+            && !self
+                .parser
+                .internal_events
+                .iter()
+                .any(InternalEvent::is_palette_report)
+            && matches!(super::unread_bytes(&self.tty_fd), Ok(0))
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn discard_matching(&mut self, matches: fn(&InternalEvent) -> bool) {
+        self.parser.internal_events.retain(|event| !matches(event));
     }
 
     #[cfg(feature = "event-stream")]
@@ -204,6 +252,9 @@ struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
     pending_escape_deadline: Option<Instant>,
+    replayed_color_prefix: bool,
+    #[cfg(feature = "event-stream")]
+    color_queries: pending_escape::ColorQueries,
     discarded_sequence: Option<DiscardedSequence>,
 }
 
@@ -239,6 +290,9 @@ impl Default for Parser {
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
             pending_escape_deadline: None,
+            replayed_color_prefix: false,
+            #[cfg(feature = "event-stream")]
+            color_queries: pending_escape::ColorQueries::default(),
             discarded_sequence: None,
         }
     }
@@ -281,30 +335,12 @@ impl Parser {
         }
     }
 
-    fn buffer_external_input(&mut self, buffer: &[u8]) {
-        self.advance(buffer, true);
-        if self.buffer.as_slice() == b"\x1b" {
-            self.pending_escape_deadline = Some(Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
-        }
-    }
-
     fn poll_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
         let Some(deadline) = self.pending_escape_deadline else {
             return timeout;
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)))
-    }
-
-    fn finish_pending_escape(&mut self) -> Option<InternalEvent> {
-        let deadline = self.pending_escape_deadline?;
-        if Instant::now() < deadline {
-            return None;
-        }
-        self.pending_escape_deadline = None;
-        let event = parse_event(&self.buffer, false).ok().flatten()?;
-        self.buffer.clear();
-        Some(event)
     }
 
     fn advance(&mut self, buffer: &[u8], more: bool) {
@@ -388,6 +424,8 @@ impl Parser {
             }
             let more = idx + 1 < buffer.len() || more;
 
+            self.interrupt_pending_osc(*byte);
+
             // A second Escape starts another input sequence. Emit the first one
             // without consuming the prefix of the next report.
             if self.buffer.as_slice() == b"\x1b" && *byte == b'\x1b' {
@@ -401,6 +439,10 @@ impl Parser {
 
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {
+                    #[cfg(feature = "event-stream")]
+                    if matches!(ie, InternalEvent::ColorSchemeReporting(_)) {
+                        self.color_queries.finish();
+                    }
                     self.internal_events.push_back(ie);
                     self.buffer.clear();
                 }
@@ -449,7 +491,7 @@ mod tests {
     use crate::terminal::sys::file_descriptor::FileDesc;
     use std::{io::Write, os::unix::net::UnixStream};
 
-    fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
+    pub(super) fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
         let (reader, writer) = UnixStream::pair().unwrap();
         #[cfg(feature = "libc")]
         let reader = {
@@ -462,6 +504,67 @@ mod tests {
             UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
             writer,
         )
+    }
+
+    #[cfg(feature = "event-stream")]
+    #[test]
+    fn handoff_preserves_both_readiness_orders() {
+        let tty = super::TTY_TOKEN;
+        let wake = super::WAKE_TOKEN;
+        for order in [[wake, tty], [tty, wake]] {
+            let (mut source, mut writer) = source_with_input();
+            source.buffer_input(b"\x1b[?", &mut Default::default());
+            source.discard_buffered_input();
+            assert!(!source.can_query());
+            writer.write_all(b"7u\x1b[3;4R").unwrap();
+            // kqueue can deliver either order in a single edge-triggered batch.
+            source
+                .poll
+                .poll(&mut source.events, Some(Duration::ZERO))
+                .unwrap();
+            source.pending_events.extend(order);
+            for token in order {
+                let result = source.try_read(Some(Duration::ZERO));
+                if token == wake {
+                    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+                } else {
+                    assert_eq!(result.unwrap(), Some(InternalEvent::CursorPosition(3, 2)));
+                }
+            }
+            assert!(source.can_query());
+        }
+    }
+
+    #[cfg(all(feature = "event-stream", feature = "bracketed-paste"))]
+    #[test]
+    fn query_waits_for_paste_and_escape_boundaries() {
+        let (mut source, mut writer) = source_with_input();
+        assert!(source.can_query());
+        writer.write_all(b"\x1b[?997;2n\x1b[200~draft").unwrap();
+        assert!(!source.can_query());
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::ColorSchemeChanged)
+        );
+        assert!(!source.can_query());
+        writer.write_all(b"\x1b[201~\x1b").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::Event(Event::Paste("draft".into())))
+        );
+        assert!(!source.can_query());
+        writer.write_all(b"\x1b[?2031;2$y").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+        );
+        // A reply queued behind the key belongs to an earlier query.
+        assert!(!source.can_query());
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::ColorSchemeReporting(2))
+        );
+        assert!(source.can_query());
     }
 
     #[test]
@@ -947,35 +1050,20 @@ mod tests {
             InputDiscardStatus::BracketedPasteInProgress
         );
 
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let producer = std::thread::spawn(move || {
-            let chunk = [b'y'; super::TTY_BUFFER_SIZE];
-            for index in 0..65_536 {
-                if writer.write_all(&chunk).is_err() {
-                    break;
-                }
-                if index == 0 {
-                    ready_tx.send(()).unwrap();
-                }
-            }
-        });
-        ready_rx.recv().unwrap();
-
+        // Keep the socket readable across two expired polls without racing a writer.
+        let paste = [b'y'; super::TTY_BUFFER_SIZE * 3];
+        writer.write_all(&paste).unwrap();
+        let mut remaining = paste.len() as u64;
         for _ in 0..2 {
-            assert_eq!(
-                source.try_read(Some(Duration::from_millis(10))).unwrap(),
-                None
-            );
-            assert!(source.pending_tty_readable);
+            assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), None);
+            assert!(source.pending_events.contains(&super::TTY_TOKEN));
             assert_eq!(
                 source.discard_buffered_input(),
                 InputDiscardStatus::BracketedPasteInProgress
             );
-            let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(source.tty_fd.raw_fd()) };
-            assert!(rustix::io::ioctl_fionread(fd).unwrap() > 0);
+            let unread = super::super::unread_bytes(&source.tty_fd).unwrap();
+            assert!(unread > 0 && unread < remaining);
+            remaining = unread;
         }
-
-        drop(source);
-        producer.join().unwrap();
     }
 }

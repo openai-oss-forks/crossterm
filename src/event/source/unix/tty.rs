@@ -17,6 +17,7 @@ use crate::event::timeout::PollTimeout;
 use filedescriptor::{POLLIN, poll, pollfd};
 
 use crate::event::InputDiscardStatus;
+use crate::event::source::ReadGoal;
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{internal::InternalEvent, source::EventSource, sys::unix::parse::parse_event};
@@ -44,9 +45,11 @@ impl WakePipe {
 // reading on macOS/Linux -> we don't need bigger buffer and 1k of bytes
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
-const BUFFERED_ESCAPE_TIMEOUT: Duration = Duration::from_millis(20);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+#[path = "pending_escape.rs"]
+mod pending_escape;
 
 pub(crate) struct UnixInternalEventSource {
     parser: Parser,
@@ -109,6 +112,17 @@ fn read_complete(fd: &FileDesc, buf: &mut [u8]) -> io::Result<usize> {
 
 impl EventSource for UnixInternalEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+        self.read_until(timeout, ReadGoal::Event)
+    }
+
+    fn read_until(
+        &mut self,
+        timeout: Option<Duration>,
+        goal: ReadGoal,
+    ) -> io::Result<Option<InternalEvent>> {
+        if let Some(event) = self.parser.next() {
+            return Ok(Some(event));
+        }
         let timeout = PollTimeout::new(timeout);
 
         fn make_pollfd<F: AsRawFd>(fd: &F) -> pollfd {
@@ -132,13 +146,15 @@ impl EventSource for UnixInternalEventSource {
             make_pollfd(&self.wake_pipe.receiver),
         ];
 
-        while timeout.leftover().is_none_or(|t| !t.is_zero())
+        let mut first_poll = true;
+        while first_poll
+            || timeout.leftover().is_none_or(|t| !t.is_zero())
             || self.parser.pending_escape_expired()
         {
-            // check if there are buffered events from the last read
-            if let Some(event) = self.parser.next() {
-                return Ok(Some(event));
+            if goal.boundary_reached(self) {
+                return Ok(None);
             }
+            first_poll = false;
             match poll(&mut fds, self.parser.poll_timeout(timeout.leftover())) {
                 Err(filedescriptor::Error::Poll(e)) | Err(filedescriptor::Error::Io(e)) => {
                     match e.kind() {
@@ -166,9 +182,7 @@ impl EventSource for UnixInternalEventSource {
                         return Ok(Some(event));
                     }
 
-                    // The source owns this descriptor for the lifetime of its borrow.
-                    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty.raw_fd()) };
-                    if read_count == 0 || rustix::io::ioctl_fionread(fd)? == 0 {
+                    if read_count == 0 || super::unread_bytes(&self.tty)? == 0 {
                         break;
                     }
                     if timeout.elapsed() {
@@ -217,7 +231,7 @@ impl EventSource for UnixInternalEventSource {
     }
 
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>) {
-        self.parser.buffer_external_input(input);
+        self.parser.buffer_replayed_input(input);
         events.extend(
             self.parser
                 .by_ref()
@@ -227,6 +241,37 @@ impl EventSource for UnixInternalEventSource {
 
     fn discard_buffered_input(&mut self) -> InputDiscardStatus {
         self.parser.discard_buffered_input()
+    }
+
+    fn has_pending_escape(&self) -> bool {
+        self.parser.has_pending_escape_key()
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn expect_color_replies(&mut self) {
+        self.parser.color_queries.begin();
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn finish_color_handoff(&mut self) {
+        self.parser.finish_color_handoff();
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn can_query(&self) -> bool {
+        self.parser.buffer.is_empty()
+            && self.parser.discarded_sequence.is_none()
+            && !self
+                .parser
+                .internal_events
+                .iter()
+                .any(InternalEvent::is_palette_report)
+            && matches!(super::unread_bytes(&self.tty), Ok(0))
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn discard_matching(&mut self, matches: fn(&InternalEvent) -> bool) {
+        self.parser.internal_events.retain(|event| !matches(event));
     }
 
     #[cfg(feature = "event-stream")]
@@ -246,6 +291,9 @@ struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
     pending_escape_deadline: Option<Instant>,
+    replayed_color_prefix: bool,
+    #[cfg(feature = "event-stream")]
+    color_queries: pending_escape::ColorQueries,
     discarded_sequence: Option<DiscardedSequence>,
 }
 
@@ -281,6 +329,9 @@ impl Default for Parser {
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
             pending_escape_deadline: None,
+            replayed_color_prefix: false,
+            #[cfg(feature = "event-stream")]
+            color_queries: pending_escape::ColorQueries::default(),
             discarded_sequence: None,
         }
     }
@@ -323,35 +374,12 @@ impl Parser {
         }
     }
 
-    fn buffer_external_input(&mut self, buffer: &[u8]) {
-        self.advance(buffer, true);
-        if self.buffer.as_slice() == b"\x1b" {
-            self.pending_escape_deadline = Some(Instant::now() + BUFFERED_ESCAPE_TIMEOUT);
-        }
-    }
-
     fn poll_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
         let Some(deadline) = self.pending_escape_deadline else {
             return timeout;
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)))
-    }
-
-    fn pending_escape_expired(&self) -> bool {
-        self.pending_escape_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    }
-
-    fn finish_pending_escape(&mut self) -> Option<InternalEvent> {
-        let deadline = self.pending_escape_deadline?;
-        if Instant::now() < deadline {
-            return None;
-        }
-        self.pending_escape_deadline = None;
-        let event = parse_event(&self.buffer, false).ok().flatten()?;
-        self.buffer.clear();
-        Some(event)
     }
 
     fn advance(&mut self, buffer: &[u8], more: bool) {
@@ -435,6 +463,8 @@ impl Parser {
             }
             let more = idx + 1 < buffer.len() || more;
 
+            self.interrupt_pending_osc(*byte);
+
             // A second Escape starts another input sequence. Emit the first one
             // without consuming the prefix of the next report.
             if self.buffer.as_slice() == b"\x1b" && *byte == b'\x1b' {
@@ -448,6 +478,10 @@ impl Parser {
 
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {
+                    #[cfg(feature = "event-stream")]
+                    if matches!(ie, InternalEvent::ColorSchemeReporting(_)) {
+                        self.color_queries.finish();
+                    }
                     self.internal_events.push_back(ie);
                     self.buffer.clear();
                 }
@@ -496,7 +530,7 @@ mod tests {
     use crate::terminal::sys::file_descriptor::FileDesc;
     use std::{io::Write, os::unix::net::UnixStream};
 
-    fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
+    pub(super) fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
         let (reader, writer) = UnixStream::pair().unwrap();
         #[cfg(feature = "libc")]
         let reader = {
@@ -509,6 +543,21 @@ mod tests {
             UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
             writer,
         )
+    }
+
+    #[test]
+    fn zero_timeout_reads_available_input_and_buffered_cursor_replies() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"a\x1b[3;4R").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('a').into()))),
+        );
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::CursorPosition(3, 2)),
+        );
+        assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), None);
     }
 
     #[test]
@@ -948,34 +997,19 @@ mod tests {
             InputDiscardStatus::BracketedPasteInProgress
         );
 
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let producer = std::thread::spawn(move || {
-            let chunk = [b'y'; super::TTY_BUFFER_SIZE];
-            for index in 0..65_536 {
-                if writer.write_all(&chunk).is_err() {
-                    break;
-                }
-                if index == 0 {
-                    ready_tx.send(()).unwrap();
-                }
-            }
-        });
-        ready_rx.recv().unwrap();
-
+        // Keep the socket readable across two expired polls without racing a writer.
+        let paste = [b'y'; super::TTY_BUFFER_SIZE * 3];
+        writer.write_all(&paste).unwrap();
+        let mut remaining = paste.len() as u64;
         for _ in 0..2 {
-            assert_eq!(
-                source.try_read(Some(Duration::from_millis(10))).unwrap(),
-                None
-            );
+            assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), None);
             assert_eq!(
                 source.discard_buffered_input(),
                 InputDiscardStatus::BracketedPasteInProgress
             );
-            let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(source.tty.raw_fd()) };
-            assert!(rustix::io::ioctl_fionread(fd).unwrap() > 0);
+            let unread = super::super::unread_bytes(&source.tty).unwrap();
+            assert!(unread > 0 && unread < remaining);
+            remaining = unread;
         }
-
-        drop(source);
-        producer.join().unwrap();
     }
 }
