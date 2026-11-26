@@ -16,7 +16,7 @@ pub(crate) fn lock_event_reader() -> MappedMutexGuard<'static, InternalEventRead
     })
 }
 
-fn try_lock_event_reader_for(
+pub(crate) fn try_lock_event_reader_for(
     duration: Duration,
 ) -> Option<MappedMutexGuard<'static, InternalEventReader>> {
     Some(MutexGuard::map(
@@ -81,6 +81,38 @@ pub(crate) enum InternalEvent {
     /// OSC color response (`slot`, `payload`).
     #[cfg(unix)]
     OscColor { slot: u8, payload: OscColorPayload },
+    /// A DEC mode 2031 palette-change notification.
+    #[cfg(unix)]
+    ColorSchemeChanged,
+    /// DECRPM for mode 2031. Only modes 1 (set) and 2 (reset) are mutable.
+    #[cfg(unix)]
+    ColorSchemeReporting(u8),
+    /// Echo of a numbered mode query used when retrying a timed-out handoff.
+    #[cfg(all(unix, feature = "event-stream"))]
+    ColorHandoffMarker(u16),
+}
+
+#[cfg(all(unix, feature = "event-stream"))]
+pub(crate) const HANDOFF_MODES: std::ops::RangeInclusive<u16> = 30000..=32767;
+
+#[cfg(all(unix, feature = "event-stream"))]
+impl InternalEvent {
+    pub(crate) fn is_palette_report(&self) -> bool {
+        matches!(
+            self,
+            Self::OscColor { slot: 10 | 11, .. }
+                | Self::ColorSchemeChanged
+                | Self::ColorSchemeReporting(_)
+        )
+    }
+
+    pub(crate) fn is_handoff_report(&self) -> bool {
+        self.is_palette_report()
+            || matches!(
+                self,
+                Self::PrimaryDeviceAttributes | Self::ColorHandoffMarker(_)
+            )
+    }
 }
 
 /// Parsed payload of an OSC color response.

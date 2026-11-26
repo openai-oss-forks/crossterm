@@ -4,6 +4,19 @@ use crate::event::internal::InternalEvent;
 pub(crate) trait Filter: Send + Sync + 'static {
     /// Returns whether the given event fulfills the filter.
     fn eval(&self, event: &InternalEvent) -> bool;
+
+    /// Return true only for unmatched reports this consumer can safely discard.
+    fn discard_unmatched(&self, _event: &InternalEvent) -> bool {
+        false
+    }
+}
+
+// Match a specific terminal reply, including the mode number on handoff retries.
+#[cfg(all(unix, feature = "event-stream"))]
+impl Filter for InternalEvent {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        self == event
+    }
 }
 
 #[cfg(unix)]
@@ -66,6 +79,20 @@ impl Filter for OscColorFilter {
 pub(crate) struct EventFilter;
 
 impl Filter for EventFilter {
+    // Ordinary input readers previously ignored these CSI replies. Accumulating them
+    // would grow the queue and let an old mode status answer a later subscriber's query.
+    #[cfg(unix)]
+    fn discard_unmatched(&self, event: &InternalEvent) -> bool {
+        #[cfg(feature = "event-stream")]
+        if matches!(event, InternalEvent::ColorHandoffMarker(_)) {
+            return true;
+        }
+        matches!(
+            event,
+            InternalEvent::ColorSchemeChanged | InternalEvent::ColorSchemeReporting(_)
+        )
+    }
+
     #[cfg(unix)]
     fn eval(&self, event: &InternalEvent) -> bool {
         matches!(*event, InternalEvent::Event(_))

@@ -132,9 +132,12 @@ impl EventSource for UnixInternalEventSource {
             make_pollfd(&self.wake_pipe.receiver),
         ];
 
-        while timeout.leftover().is_none_or(|t| !t.is_zero())
+        let mut first_poll = true;
+        while first_poll
+            || timeout.leftover().is_none_or(|t| !t.is_zero())
             || self.parser.pending_escape_expired()
         {
+            first_poll = false;
             // check if there are buffered events from the last read
             if let Some(event) = self.parser.next() {
                 return Ok(Some(event));
@@ -166,9 +169,7 @@ impl EventSource for UnixInternalEventSource {
                         return Ok(Some(event));
                     }
 
-                    // The source owns this descriptor for the lifetime of its borrow.
-                    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(self.tty.raw_fd()) };
-                    if read_count == 0 || rustix::io::ioctl_fionread(fd)? == 0 {
+                    if read_count == 0 || super::unread_bytes(&self.tty)? == 0 {
                         break;
                     }
                     if timeout.elapsed() {
@@ -227,6 +228,23 @@ impl EventSource for UnixInternalEventSource {
 
     fn discard_buffered_input(&mut self) -> InputDiscardStatus {
         self.parser.discard_buffered_input()
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn can_query(&self) -> bool {
+        self.parser.buffer.is_empty()
+            && self.parser.discarded_sequence.is_none()
+            && !self
+                .parser
+                .internal_events
+                .iter()
+                .any(InternalEvent::is_palette_report)
+            && matches!(super::unread_bytes(&self.tty), Ok(0))
+    }
+
+    #[cfg(feature = "event-stream")]
+    fn discard_matching(&mut self, matches: fn(&InternalEvent) -> bool) {
+        self.parser.internal_events.retain(|event| !matches(event));
     }
 
     #[cfg(feature = "event-stream")]
@@ -509,6 +527,21 @@ mod tests {
             UnixInternalEventSource::from_file_descriptor(reader).unwrap(),
             writer,
         )
+    }
+
+    #[test]
+    fn zero_timeout_reads_available_input_and_buffered_cursor_replies() {
+        let (mut source, mut writer) = source_with_input();
+        writer.write_all(b"a\x1b[3;4R").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('a').into()))),
+        );
+        assert_eq!(
+            source.try_read(Some(Duration::ZERO)).unwrap(),
+            Some(InternalEvent::CursorPosition(3, 2)),
+        );
+        assert_eq!(source.try_read(Some(Duration::ZERO)).unwrap(), None);
     }
 
     #[test]

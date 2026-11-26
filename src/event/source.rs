@@ -35,6 +35,14 @@ pub(crate) trait EventSource: Sync + Send {
     #[cfg(unix)]
     fn discard_buffered_input(&mut self) -> InputDiscardStatus;
 
+    /// Whether a query can be sent without inserting its response into a partial input frame.
+    #[cfg(all(unix, feature = "event-stream"))]
+    fn can_query(&self) -> bool;
+
+    /// Remove matching responses already decoded into the source's local queue.
+    #[cfg(all(unix, feature = "event-stream"))]
+    fn discard_matching(&mut self, matches: fn(&InternalEvent) -> bool);
+
     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker;

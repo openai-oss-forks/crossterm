@@ -232,6 +232,22 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         // parser consumes completed, unhandled CSI replies without producing keys.
         b'>' => None,
         b'?' => match buffer[buffer.len() - 1] {
+            b'y' if buffer.starts_with(b"\x1b[?2031;")
+                && matches!(&buffer[8..], [b'0'..=b'4', b'$', b'y']) =>
+            {
+                return Ok(Some(InternalEvent::ColorSchemeReporting(buffer[8] - b'0')));
+            }
+            #[cfg(feature = "event-stream")]
+            b'y' if buffer.len() == 12 && buffer.ends_with(b";0$y") => {
+                let mode = std::str::from_utf8(&buffer[3..8])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|mode| crate::event::internal::HANDOFF_MODES.contains(mode));
+                return Ok(mode.map(InternalEvent::ColorHandoffMarker));
+            }
+            b'n' if matches!(buffer, b"\x1b[?997;1n" | b"\x1b[?997;2n") => {
+                return Ok(Some(InternalEvent::ColorSchemeChanged));
+            }
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
             _ => None,
@@ -1132,6 +1148,30 @@ mod tests {
             parse_csi(b"\x1B[O").unwrap(),
             Some(InternalEvent::Event(Event::FocusLost))
         );
+        for status in 0..=4 {
+            let report = format!("\x1b[?2031;{status}$y");
+            for end in 2..report.len() {
+                assert_eq!(parse_csi(&report.as_bytes()[..end]).unwrap(), None);
+            }
+            assert_eq!(
+                parse_csi(report.as_bytes()).unwrap(),
+                Some(InternalEvent::ColorSchemeReporting(status))
+            );
+        }
+        #[cfg(feature = "event-stream")]
+        assert_eq!(
+            parse_csi(b"\x1b[?30001;0$y").unwrap(),
+            Some(InternalEvent::ColorHandoffMarker(30001))
+        );
+        for notification in [b"\x1b[?997;1n", b"\x1b[?997;2n"] {
+            for end in 2..notification.len() {
+                assert_eq!(parse_csi(&notification[..end]).unwrap(), None);
+            }
+            assert_eq!(
+                parse_csi(notification).unwrap(),
+                Some(InternalEvent::ColorSchemeChanged)
+            );
+        }
     }
 
     #[test]
