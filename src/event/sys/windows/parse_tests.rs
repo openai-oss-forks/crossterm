@@ -2,7 +2,7 @@
 
 use super::*;
 use crossterm_winapi::InputRecord;
-use winapi::um::wincon::{INPUT_RECORD, KEY_EVENT};
+use winapi::um::wincon::{INPUT_RECORD, KEY_EVENT, NUMLOCK_ON};
 
 #[test]
 fn preserves_escape_and_literal_characters_from_console_records() {
@@ -15,6 +15,9 @@ fn preserves_escape_and_literal_characters_from_console_records() {
         (0, ';', KeyCode::Char(';')),
         (0, '2', KeyCode::Char('2')),
         (0, 'u', KeyCode::Char('u')),
+        (0x41, 'A', KeyCode::Char('A')),
+        (0x42, 'B', KeyCode::Char('B')),
+        (0xc0, '~', KeyCode::Char('~')),
     ] {
         for (key_down, kind) in [(1, KeyEventKind::Press), (0, KeyEventKind::Release)] {
             for (control_key_state, modifiers) in [
@@ -45,4 +48,61 @@ fn preserves_escape_and_literal_characters_from_console_records() {
             }
         }
     }
+}
+
+fn alt_code_record(u_char: u16, control_key_state: u32) -> KeyEventRecord {
+    // INPUT_RECORD contains only integers and unions of integer records.
+    let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+    record.EventType = KEY_EVENT;
+    unsafe {
+        let key = record.Event.KeyEvent_mut();
+        key.bKeyDown = 0;
+        key.wRepeatCount = 1;
+        key.wVirtualKeyCode = VK_MENU as u16;
+        key.wVirtualScanCode = 56;
+        *key.uChar.UnicodeChar_mut() = u_char;
+        key.dwControlKeyState = control_key_state;
+    }
+    let InputRecord::KeyEvent(key) = InputRecord::from(record) else {
+        panic!("expected a key input record");
+    };
+    key
+}
+
+#[test]
+fn completed_bmp_alt_code_is_a_press_event() {
+    // Classic Console Host completes Alt+0126 with Num Lock on and Alt already clear.
+    for (character, control_key_state) in [('♣', 0), ('~', NUMLOCK_ON)] {
+        let mut surrogate_buffer = None;
+        let event = handle_key_event(
+            alt_code_record(character as u16, control_key_state),
+            &mut surrogate_buffer,
+        );
+
+        assert_eq!(
+            event,
+            Some(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )))
+        );
+    }
+}
+
+#[test]
+fn completed_surrogate_alt_code_is_a_press_event() {
+    let mut surrogate_buffer = None;
+    assert_eq!(
+        handle_key_event(alt_code_record(0xd83e, 0), &mut surrogate_buffer),
+        None
+    );
+    assert_eq!(
+        handle_key_event(alt_code_record(0xddb8, 0), &mut surrogate_buffer),
+        Some(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('🦸'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )))
+    );
 }
