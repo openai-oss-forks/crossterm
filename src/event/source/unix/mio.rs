@@ -7,6 +7,7 @@ use std::{
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use signal_hook_mio::v1_0::Signals;
 
+use super::{DiscardedSequence, SGR_MOUSE, advance_sgr_mouse};
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{
@@ -207,17 +208,6 @@ struct Parser {
     discarded_sequence: Option<DiscardedSequence>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DiscardedSequence {
-    PasteStart(usize),
-    PasteBody(usize),
-    OscBody,
-    OscEscape,
-    Csi,
-    X10Mouse(usize),
-    Ss3,
-}
-
 impl Default for Parser {
     fn default() -> Self {
         Parser {
@@ -269,7 +259,10 @@ impl Parser {
                 self.discarded_sequence = Some(DiscardedSequence::Ss3);
             }
         }
-        self.buffer.clear();
+        // Retain the parameters so a delayed NaN still belongs to this report.
+        if !self.buffer.starts_with(SGR_MOUSE) {
+            self.buffer.clear();
+        }
         self.internal_events.clear();
         self.pending_escape_deadline = None;
         match self.discarded_sequence {
@@ -310,6 +303,9 @@ impl Parser {
     fn advance(&mut self, buffer: &[u8], more: bool) {
         self.pending_escape_deadline = None;
         for (idx, byte) in buffer.iter().enumerate() {
+            if advance_sgr_mouse(&mut self.buffer, &mut self.discarded_sequence, *byte) {
+                continue;
+            }
             if let Some(discarded_sequence) = self.discarded_sequence {
                 self.discarded_sequence = match discarded_sequence {
                     DiscardedSequence::PasteStart(matched)
@@ -437,6 +433,10 @@ impl Iterator for Parser {
         self.internal_events.pop_front()
     }
 }
+
+#[cfg(test)]
+#[path = "sgr_mouse_tests.rs"]
+mod sgr_mouse_tests;
 
 #[cfg(test)]
 #[path = "../secondary_device_attributes_tests.rs"]
