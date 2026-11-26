@@ -4,7 +4,6 @@ use super::internal::InternalEvent;
 #[cfg(unix)]
 use std::collections::VecDeque;
 
-#[cfg(unix)]
 use super::InputDiscardStatus;
 
 #[cfg(feature = "event-stream")]
@@ -31,8 +30,13 @@ pub(crate) trait EventSource: Sync + Send {
     #[cfg(unix)]
     fn buffer_input(&mut self, input: &[u8], events: &mut VecDeque<InternalEvent>);
 
+    #[cfg(windows)]
+    fn prepare_windows_framed_paste(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<Option<super::Win32InputMode>>;
+
     /// Discards buffered input while preserving incomplete control-sequence boundaries.
-    #[cfg(unix)]
     fn discard_buffered_input(&mut self) -> InputDiscardStatus;
 
     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.

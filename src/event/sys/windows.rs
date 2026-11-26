@@ -8,8 +8,12 @@ use crossterm_winapi::{ConsoleMode, Handle};
 
 pub(crate) mod parse;
 pub(crate) mod poll;
+pub(crate) mod vt_input;
+#[path = "unix/parse.rs"]
+pub(crate) mod vt_parse;
 #[cfg(feature = "event-stream")]
 pub(crate) mod waker;
+mod win32_report;
 
 const ENABLE_MOUSE_MODE: u32 = 0x0010 | 0x0080 | 0x0008;
 

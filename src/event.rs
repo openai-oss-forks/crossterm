@@ -229,7 +229,6 @@ pub fn poll(timeout: Duration) -> std::io::Result<bool> {
 pub fn read() -> std::io::Result<Event> {
     match internal::read(&EventFilter)? {
         InternalEvent::Event(event) => Ok(event),
-        #[cfg(unix)]
         _ => unreachable!(),
     }
 }
@@ -252,8 +251,41 @@ pub fn buffer_input(input: &[u8]) -> std::io::Result<()> {
     internal::lock_event_reader().buffer_input(input)
 }
 
+/// The mutable Win32 keyboard reporting mode before a framed paste session.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Win32InputMode {
+    /// Win32 keyboard reporting was already enabled.
+    Enabled,
+    /// Win32 keyboard reporting was disabled.
+    Disabled,
+}
+
+/// Prepare the Windows event reader for bracketed paste with Win32 key reports.
+///
+/// Call after enabling bracketed paste, in native console record mode with event
+/// streams paused. Checks the terminal's bracketed paste and Win32 keyboard
+/// reporting modes via DECRQM. Unrelated events stay in the shared reader.
+///
+/// On success, the caller can enable private mode 9001 and the
+/// ENABLE_VIRTUAL_TERMINAL_INPUT console flag. Restore both on handoff.
+/// With no confirmation, keep using native input. The function does not
+/// change either mode itself.
+#[cfg(windows)]
+pub fn prepare_windows_framed_paste(timeout: Duration) -> std::io::Result<Option<Win32InputMode>> {
+    if !cfg!(feature = "bracketed-paste") || timeout.is_zero() {
+        return Ok(None);
+    }
+    let start = std::time::Instant::now();
+    match internal::try_lock_event_reader_for(timeout) {
+        Some(mut reader) => {
+            reader.prepare_windows_framed_paste(timeout.saturating_sub(start.elapsed()))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Whether discarding buffered input encountered an incomplete control sequence.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputDiscardStatus {
     /// Buffered events and incomplete input sequences were fully discarded.
@@ -274,7 +306,6 @@ pub enum InputDiscardStatus {
 /// Drop or pause all active `EventStream`s and other blocking event-reader users before calling this
 /// function. Event readers share a global lock, so a concurrently blocked reader can prevent it from
 /// returning.
-#[cfg(unix)]
 pub fn discard_buffered_input() -> std::io::Result<InputDiscardStatus> {
     internal::lock_event_reader().discard_buffered_input()
 }
@@ -304,7 +335,6 @@ pub fn try_read() -> Option<Event> {
     match internal::try_read(&EventFilter) {
         Some(InternalEvent::Event(event)) => Some(event),
         None => None,
-        #[cfg(unix)]
         _ => unreachable!(),
     }
 }

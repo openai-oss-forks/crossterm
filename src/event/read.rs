@@ -1,6 +1,5 @@
 use std::{collections::vec_deque::VecDeque, io, time::Duration};
 
-#[cfg(unix)]
 use crate::event::InputDiscardStatus;
 #[cfg(unix)]
 use crate::event::source::unix::UnixInternalEventSource;
@@ -47,7 +46,17 @@ impl InternalEventReader {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    pub(crate) fn prepare_windows_framed_paste(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<Option<super::Win32InputMode>> {
+        self.source
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Failed to initialize input reader"))?
+            .prepare_windows_framed_paste(timeout)
+    }
+
     pub(crate) fn discard_buffered_input(&mut self) -> io::Result<InputDiscardStatus> {
         let source = self
             .source
@@ -564,7 +573,14 @@ mod tests {
             );
         }
 
-        #[cfg(unix)]
+        #[cfg(windows)]
+        fn prepare_windows_framed_paste(
+            &mut self,
+            _: Duration,
+        ) -> io::Result<Option<crate::event::Win32InputMode>> {
+            unreachable!()
+        }
+
         fn discard_buffered_input(&mut self) -> super::InputDiscardStatus {
             self.events.clear();
             super::InputDiscardStatus::Complete
